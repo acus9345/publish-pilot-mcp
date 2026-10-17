@@ -163,6 +163,8 @@ export interface JobOptions extends RunOptions {
   label: string;
   /** Called once for each new URL detected in the output. */
   onUrl?: (url: string) => void;
+  /** Runs after the process exits and before the job is marked finished; returned text is appended to the output. */
+  finalize?: (job: Job) => Promise<string | void>;
 }
 
 /** Start a command in the background and return immediately. */
@@ -209,8 +211,18 @@ export function startJob(cmd: string, args: readonly string[], opts: JobOptions)
   });
   child.on("close", (code) => {
     job.exitCode = code;
-    job.running = false;
-    notify();
+    const finish = (): void => {
+      job.running = false;
+      notify();
+    };
+    if (!opts.finalize) return finish();
+    opts
+      .finalize(job)
+      .then((extra) => {
+        if (extra) job.output = append(job.output, `\n${redact(extra)}`);
+      })
+      .catch(() => undefined)
+      .finally(finish);
   });
   jobs.set(id, job);
   return job;
@@ -240,7 +252,7 @@ export function startTerminalJob(cmd: string, args: readonly string[], opts: Job
       `Write-Host ${psQuote(opts.intro ?? "publish-pilot started this command. Follow any prompt below.")} -ForegroundColor Yellow`,
       `& ${[cmd, ...args].map(psQuote).join(" ")}`,
       "$code = $LASTEXITCODE",
-      "if ($code -ne 0) { Read-Host 'It failed (see above). Press Enter to close' } else { Write-Host 'Done. This window closes in 5 seconds.' -ForegroundColor Green; Start-Sleep 5 }",
+      "if ($code -ne 0) { Write-Host 'It failed (see above). This window closes in 60 seconds.' -ForegroundColor Red; Start-Sleep 60 } else { Write-Host 'Done. This window closes in 5 seconds.' -ForegroundColor Green; Start-Sleep 5 }",
       "exit $code",
     ].join("\n");
     const launcher =

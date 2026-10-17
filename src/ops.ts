@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { addChangelogEntry, bumpSemver, changelogSection, readManifest, writeManifestVersion, type BumpLevel, type ManifestKind } from "./changelog.js";
 import { openUrl } from "./desktop.js";
@@ -256,13 +256,35 @@ async function packageOnRegistry(name: string): Promise<boolean | null> {
   }
 }
 
-const APPROVAL_URL =/^https:\/\/(www\.)?npmjs\.com\/(login|auth)\//i;
+const APPROVAL_URL = /^https:\/\/(www\.)?npmjs\.com\/(login|auth)\//i;
+
+/**
+ * The error lines of the newest npm debug log written since `since`. A visible window's output
+ * can't be captured, so this is how the job learns why npm failed. One-time auth ids are hidden.
+ */
+export async function npmLogErrors(since: number, logsDir = join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "npm-cache", "_logs")): Promise<string | undefined> {
+  if (!existsSync(logsDir)) return undefined;
+  const logs = [];
+  for (const name of await readdir(logsDir)) {
+    if (!name.endsWith("-debug-0.log")) continue;
+    const info = await stat(join(logsDir, name));
+    if (info.mtimeMs >= since) logs.push({ name, mtime: info.mtimeMs });
+  }
+  const newest = logs.sort((a, b) => b.mtime - a.mtime)[0];
+  if (!newest) return undefined;
+  const lines = (await readFile(join(logsDir, newest.name), "utf8"))
+    .split(/\r?\n/)
+    .filter((line) => /^\d+ error |http fetch (PUT|POST|DELETE) \d{3}/.test(line))
+    .map((line) => line.replace(/^\d+ /, "").replace(/(auth\/cli\/|authId=)[\w-]+/g, "$1***"));
+  return lines.length ? `[npm debug log]\n${lines.slice(-15).join("\n")}` : undefined;
+}
 
 /**
  * npm only shows its 2FA / login link and waits for approval when it runs in a real terminal,
  * so npm approval steps run through startTerminalJob (a visible window on Windows).
  */
 function npmApprovalJob(args: string[], dir: string | undefined, label: string, openBrowser: boolean): Job {
+  const startedAt = Date.now() - 1000;
   return startTerminalJob("npm", args, {
     cwd: dir,
     label,
@@ -270,6 +292,7 @@ function npmApprovalJob(args: string[], dir: string | undefined, label: string, 
     onUrl: (url) => {
       if (openBrowser && APPROVAL_URL.test(url)) void openUrl(url);
     },
+    finalize: process.platform === "win32" ? () => npmLogErrors(startedAt) : undefined,
   });
 }
 
