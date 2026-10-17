@@ -49,6 +49,18 @@ const targetArg = z.enum(["repo", "package", "both"]).describe("What to publish:
 
 const abs = (dir: string): string => resolve(dir);
 
+/** Explain common ways a login or publish job ends badly, and what to do next. */
+export function jobHint(running: boolean, exitCode: number | null, output: string): string | undefined {
+  if (running || exitCode === 0) return undefined;
+  if (/E429|Too Many Requests|rate limit/i.test(output)) {
+    return "The registry rate-limited this account (npm limits how many new packages one account can create in about 24 hours). Nothing was published. Wait, often a few hours, then call publish_package again; checking every 15–30 minutes is enough.";
+  }
+  if (/E403.*(previously published|cannot publish over)/i.test(output)) return "This version already exists. Run bump_version, commit, and publish the new version.";
+  if (/E403|E404/.test(output) && /similar to existing|too similar/i.test(output)) return "npm rejected the name as too similar to an existing package. Use check_names to pick another name (a scoped @you/name always works).";
+  if (/expired|E401|timed out|timeout/i.test(output)) return "The approval link expired or the login is no longer valid. Start the same tool again for a fresh link (call login first if npm whoami fails).";
+  return undefined;
+}
+
 /** Build the publish-pilot MCP server with all tools and the publish_project prompt. */
 export function createServer(): McpServer {
   const server = new McpServer(
@@ -174,9 +186,8 @@ export function createServer(): McpServer {
       if (sendEnter) writeToJob(job, "\n");
       await waitForJob(job, waitSeconds * 1000);
       const info = describeJob(job);
-      if (!job.running && job.exitCode !== 0 && /expired|E401|timed out|timeout/i.test(job.output)) {
-        info.hint = "The approval link expired. Start the same tool again for a fresh link.";
-      }
+      const hint = jobHint(job.running, job.exitCode, job.output);
+      if (hint) info.hint = hint;
       return info;
     }),
   );
