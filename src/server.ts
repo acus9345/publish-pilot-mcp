@@ -8,6 +8,7 @@ import { describeJob, getJob, listJobs, run, runShell, stopJob, waitForJob, writ
 import { checkCommand } from "./guard.js";
 import { checkRepoName, findFreeName, githubLogin } from "./names.js";
 import {
+  RATE_LIMITED,
   UserError,
   bumpVersion,
   createGithubRepo,
@@ -52,8 +53,8 @@ const abs = (dir: string): string => resolve(dir);
 /** Explain common ways a login or publish job ends badly, and what to do next. */
 export function jobHint(running: boolean, exitCode: number | null, output: string): string | undefined {
   if (running || exitCode === 0) return undefined;
-  if (/E429|Too Many Requests|rate limit/i.test(output)) {
-    return "The registry rate-limited publishing (npm caps how many packages and versions an account can publish, and does not say the limit). Nothing was published. Do NOT retry soon: each failed attempt can extend the block. publish_package now refuses for 24 hours; tell the user, and wait, or ask npm support (https://www.npmjs.com/support) to lift it.";
+  if (RATE_LIMITED.test(output)) {
+    return "The registry rate-limited publishing (npm, PyPI and crates.io cap how many packages and versions an account can publish in a short time, and do not say the limit). Nothing was published. Do NOT retry soon: each failed attempt can extend the block. publish_package now refuses for 24 hours; tell the user, and wait, or ask the registry's support to lift it.";
   }
   if (/E403.*(previously published|cannot publish over)/i.test(output)) return "This version already exists. Run bump_version, commit, and publish the new version.";
   if (/E403|E404/.test(output) && /similar to existing|too similar/i.test(output)) return "npm rejected the name as too similar to an existing package. Use check_names to pick another name (a scoped @you/name always works).";
@@ -327,12 +328,12 @@ export function createServer(): McpServer {
     {
       title: "Publish the package",
       description:
-        "Publish from the terminal (npm publish [--access public], twine upload, cargo publish). Skips when the version already exists, and for 24 hours after the registry answered E429 (retries can extend a rate-limit block). Returns a job; npm approval runs in a real terminal. If an approval link expires, call again.",
+        "Publish from the terminal (npm publish [--access public], twine upload, cargo publish). Uploads only the current version's files. Skips when the version already exists, and for 24 hours after the registry rate-limited publishing (429; retries can extend the block). Returns a job; npm approval runs in a real terminal. If an approval link expires, call again.",
       inputSchema: {
         dir: dirArg,
-        dryRun: z.boolean().default(false),
+        dryRun: z.boolean().default(false).describe("Check without uploading: npm publish --dry-run, twine check, cargo publish --dry-run."),
         openBrowser: z.boolean().default(true).describe("Open approval pages in the default browser."),
-        force: z.boolean().default(false).describe("Publish even within 24 hours of an E429. Only when the user confirms the block was lifted."),
+        force: z.boolean().default(false).describe("Publish even within 24 hours of a rate limit (429). Only when the user confirms the block was lifted."),
       },
       annotations: { destructiveHint: false, openWorldHint: true },
     },

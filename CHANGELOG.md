@@ -3,6 +3,16 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- PyPI and crates.io publishes now get the same 24-hour wait after a rate limit (429) as npm, instead of retrying into the block.
+- `publish_package` and `inspect_package` for PyPI use only the current version's files in `dist/`. Older builds left there after `bump_version` made `twine upload` fail with "File already exists".
+- `publish_package` with `dryRun` for PyPI runs `twine check` instead of uploading to TestPyPI.
+- `inspect_package` for PyPI now scans the sdist's files for secrets and junk; it skipped the scan before.
+- `setup_trusted_publishing` waits while npm is still processing a brand-new package (only the `0.0.0-stage` placeholder is listed), and `publish_package` says the first version can take a minute or two to appear.
+
 ## [0.1.0] - 2026-10-17
 
 ### Added

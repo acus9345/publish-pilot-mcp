@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractJson, parsePackJson, pickRun, prependPath } from "../src/ops.js";
+import { currentDistFiles, extractJson, npmPackageState, parsePackJson, pickRun, prependPath } from "../src/ops.js";
 
 const entry = { name: "pkg", size: 10, unpackedSize: 20, files: [{ path: "a]b.js", size: 1 }] };
 
@@ -48,5 +48,36 @@ describe("prependPath", () => {
     const sep = process.platform === "win32" ? ";" : ":";
     expect(prependPath("/bin2", { Path: "/usr/bin" })).toEqual({ Path: `/bin2${sep}/usr/bin` });
     expect(prependPath("/bin2", {})).toEqual({ PATH: "/bin2" });
+  });
+});
+
+describe("currentDistFiles", () => {
+  const files = ["my_pkg-0.1.0-py3-none-any.whl", "my_pkg-0.1.0.tar.gz", "my_pkg-0.2.0-py3-none-any.whl", "my_pkg-0.2.0.tar.gz", "other-0.2.0.tar.gz", ".gitignore"];
+
+  it("keeps only the current version's wheel and sdist", () => {
+    expect(currentDistFiles(files, "my-pkg", "0.2.0")).toEqual(["my_pkg-0.2.0-py3-none-any.whl", "my_pkg-0.2.0.tar.gz"]);
+  });
+
+  it("accepts sdists that keep the dashed name", () => {
+    expect(currentDistFiles(["My-Pkg-1.0.0.tar.gz"], "My-Pkg", "1.0.0")).toEqual(["My-Pkg-1.0.0.tar.gz"]);
+  });
+
+  it("does not match a longer version with the same prefix", () => {
+    expect(currentDistFiles(["my_pkg-0.2.0.post1.tar.gz", "my_pkg-0.2.01-py3-none-any.whl"], "my_pkg", "0.2.0")).toEqual([]);
+  });
+});
+
+describe("npmPackageState", () => {
+  it("treats a package with only the staging placeholder as still processing", () => {
+    expect(npmPackageState({ versions: { "0.0.0-stage": { stub: true } } })).toBe("staging");
+  });
+
+  it("treats a real version as published", () => {
+    expect(npmPackageState({ versions: { "0.0.0-stage": { stub: true }, "0.1.0": {} } })).toBe(true);
+  });
+
+  it("treats no versions as not published", () => {
+    expect(npmPackageState({ versions: {} })).toBe(false);
+    expect(npmPackageState(null)).toBe(false);
   });
 });
