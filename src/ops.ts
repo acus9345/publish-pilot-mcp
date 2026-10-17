@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addChangelogEntry, bumpSemver, changelogSection, readManifest, writeManifestVersion, type BumpLevel, type ManifestKind } from "./changelog.js";
 import { openUrl } from "./desktop.js";
-import { describeJob, run, runShell, startJob, waitForJob, type Job, type RunResult } from "./exec.js";
+import { describeJob, run, runShell, startJob, startTerminalJob, waitForJob, type Job, type RunResult } from "./exec.js";
 import { checkRepoName, githubLogin } from "./names.js";
 import { authFor, type Registry } from "./preflight.js";
 import { scanFiles, scanProject, type SecretFinding } from "./secrets.js";
@@ -245,18 +245,38 @@ export async function versionExists(kind: ManifestKind, name: string, version: s
   }
 }
 
-const APPROVAL_URL = /^https:\/\/(www\.)?npmjs\.com\/(login|auth)\//i;
+/** Does any version of this npm package exist? `null` when unknown. */
+async function packageOnRegistry(name: string): Promise<boolean | null> {
+  try {
+    const response = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2F")}`, { signal: AbortSignal.timeout(15_000) });
+    if (response.status === 404) return false;
+    return response.ok ? true : null;
+  } catch {
+    return null;
+  }
+}
 
-function jobWithBrowser(cmd: string, args: string[], dir: string | undefined, label: string, openBrowser: boolean): Job {
-  return startJob(cmd, args, {
+const APPROVAL_URL =/^https:\/\/(www\.)?npmjs\.com\/(login|auth)\//i;
+
+/**
+ * npm only shows its 2FA / login link and waits for approval when it runs in a real terminal,
+ * so npm approval steps run through startTerminalJob (a visible window on Windows).
+ */
+function npmApprovalJob(args: string[], dir: string | undefined, label: string, openBrowser: boolean): Job {
+  return startTerminalJob("npm", args, {
     cwd: dir,
     label,
-    timeoutMs: 0,
+    intro: "npm may ask you to approve in the browser. Press Enter here to open the page if it does not open by itself, then approve. This window waits for you.",
     onUrl: (url) => {
       if (openBrowser && APPROVAL_URL.test(url)) void openUrl(url);
     },
   });
 }
+
+const WINDOW_NOTE =
+  process.platform === "win32"
+    ? "A PowerShell window opened for this step. If npm shows 'Press ENTER to open in the browser', press Enter in that window, then approve on npmjs.com."
+    : "If an npm page opened in the browser, approve it there.";
 
 /** Wait briefly for an approval URL / device code, then describe the job. */
 async function settle(job: Job, seconds = 25): Promise<Record<string, unknown>> {
@@ -283,8 +303,8 @@ export async function startLogin(service: "github" | Registry, openBrowser = tru
     };
   }
   if (service === "npm") {
-    const job = jobWithBrowser("npm", ["login", "--auth-type=web", "--registry", "https://registry.npmjs.org/"], undefined, "npm login", openBrowser);
-    return { ...(await settle(job)), forUser: "Sign in on the npm page that opened (and complete 2FA). Poll job_status until running is false." };
+    const job = npmApprovalJob(["login", "--auth-type=web", "--registry", "https://registry.npmjs.org/"], undefined, "npm login", openBrowser);
+    return { ...(await settle(job)), forUser: `${WINDOW_NOTE} Sign in (and complete 2FA). Poll job_status until running is false.` };
   }
   if (service === "pypi") {
     const page = "https://pypi.org/manage/account/publishing/";
@@ -317,14 +337,15 @@ export async function publishPackage(dir: string, opts: { dryRun?: boolean; open
   const openBrowser = opts.openBrowser ?? true;
   if (manifest.kind === "npm") {
     const args = ["publish", ...(manifest.name.startsWith("@") ? ["--access", "public"] : []), ...(opts.dryRun ? ["--dry-run"] : [])];
-    const job = jobWithBrowser("npm", args, dir, `npm publish ${manifest.name}@${manifest.version}`, openBrowser);
+    const label = `npm publish ${manifest.name}@${manifest.version}`;
+    const job = opts.dryRun ? startJob("npm", args, { cwd: dir, label }) : npmApprovalJob(args, dir, label, openBrowser);
     const info = await settle(job, 40);
     return {
       ...info,
       package: manifest.name,
       version: manifest.version,
       forUser: job.running
-        ? "Approve the publish on the npm page that opened (2FA). Poll job_status; if the job ends with an expired/401 error, call publish_package again for a fresh link."
+        ? `${WINDOW_NOTE} Poll job_status; if it ends with an expired/401 error, call publish_package again for a fresh link. On E429 (rate limit) wait instead of retrying quickly: repeated attempts can keep the limit active.`
         : undefined,
     };
   }
@@ -346,18 +367,25 @@ export async function setupTrustedPublishing(dir: string, repo: string, workflow
   const [owner, repoName] = repo.split("/") as [string, string];
   const values = { owner, repository: repoName, workflow: workflowFile, environment: "(leave empty)" };
   if (manifest.kind === "npm") {
-    const exists = await versionExists("npm", manifest.name, manifest.version);
+    const packageExists = await packageOnRegistry(manifest.name);
     const page = `https://www.npmjs.com/package/${manifest.name}/access`;
-    if (exists === false) {
-      return { ok: false, reason: "npm needs the package to exist before trusted publishing can be set. Publish the first version with publish_package, then call this again.", page, values };
+    if (packageExists === false) {
+      // Checked against the live registry: POST /-/package/<name>/trust answers 404 "Package not found".
+      return {
+        ok: false,
+        reason: "npm can only add a trusted publisher to a package that already exists. Publish the first version with publish_package, then call this again.",
+        page,
+        values,
+      };
     }
-    const job = jobWithBrowser("npm", ["trust", "github", manifest.name, "--repository", repo, "--file", workflowFile, "--allow-publish", "--yes"], dir, "npm trust github", openBrowser);
+    const job = npmApprovalJob(["trust", "github", manifest.name, "--repository", repo, "--file", workflowFile, "--allow-publish", "--yes"], dir, "npm trust github", openBrowser);
     const info = await settle(job, 40);
     return {
       ...info,
       page,
       values,
-      forUser: "Approve on the npm page that opened (2FA). If the npm CLI cannot do it, open the page above, choose GitHub Actions under Trusted Publisher, fill in the values and click Save.",
+      forUser: `${WINDOW_NOTE} If the npm CLI cannot do it, open the page above, choose GitHub Actions under Trusted Publisher, fill in the values and click Save.`,
+      next: "Push a v* tag with tag_and_release within 48 hours: npm expires trusted-publisher setups that have not published by then.",
     };
   }
   if (manifest.kind === "pypi") {

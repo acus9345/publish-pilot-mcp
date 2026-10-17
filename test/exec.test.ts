@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { childEnv, cleanOutput, describeJob, quoteWindowsArg, run, runShell, startJob, waitForJob, writeToJob } from "../src/exec.js";
+import { childEnv, cleanOutput, describeJob, psQuote, quoteWindowsArg, run, runShell, shQuote, startJob, startTerminalJob, waitForJob, writeToJob } from "../src/exec.js";
 import { fake } from "./helpers.js";
 
 const node = process.execPath;
@@ -70,6 +70,28 @@ describe("quoteWindowsArg", () => {
     expect(quoteWindowsArg("a b")).toBe('"a b"');
     expect(quoteWindowsArg('say "hi"')).toBe('"say \\"hi\\""');
     expect(quoteWindowsArg("a&b")).toBe('"a&b"');
+  });
+});
+
+describe("quoting", () => {
+  it("quotes for PowerShell", () => {
+    expect(psQuote("C:\\my file\\x")).toBe("'C:\\my file\\x'");
+    expect(psQuote("it's")).toBe("'it''s'");
+  });
+  it("quotes for sh only when needed", () => {
+    expect(shQuote("publish")).toBe("publish");
+    expect(shQuote("@scope/pkg")).toBe("@scope/pkg");
+    expect(shQuote("a b")).toBe("'a b'");
+    expect(shQuote("it's")).toBe("'it'\\''s'");
+  });
+});
+
+describe.runIf(process.platform !== "win32")("startTerminalJob (pseudo-terminal)", () => {
+  it("runs the command with a TTY and captures output", async () => {
+    const job = startTerminalJob(node, ["-e", "console.log(process.stdout.isTTY ? 'tty' : 'pipe')"], { label: "tty test" });
+    await waitForJob(job, 15_000);
+    expect(job.exitCode).toBe(0);
+    expect(job.output).toContain("tty");
   });
 });
 

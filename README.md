@@ -57,6 +57,10 @@ The server never types passwords or 2FA codes and never clicks Authorize, Approv
 - Approve the first `npm publish` on npmjs.com (2FA).
 - Approve the trusted-publisher link (`npm trust github`) with 2FA. If you prefer the website, open the package's **Settings → Trusted Publisher** page and fill in the values Claude gives you.
 
+npm only shows its approval link in a real terminal. So on Windows these npm steps run in a visible PowerShell window: if it says "Press ENTER to open in the browser", press Enter there and approve. On macOS and Linux they run under `script`, which gives npm a terminal, and the page opens in your browser.
+
+npm can only add a trusted publisher to a package that already exists, so a brand-new package is published once from your machine and every later version from GitHub Actions.
+
 After that, every release is a pushed `v*` tag. GitHub Actions publishes with OIDC, so no tokens are stored anywhere.
 
 ## Tools
@@ -118,6 +122,7 @@ node dist/cli.js --help
 
 - **`doctor` says a tool is MISSING**: ask Claude to run `install_tool`, or install it yourself (for example `winget install --id GitHub.cli -e`). Then restart your MCP client so it picks up the new PATH.
 - **Claude Desktop on Windows can't start the server**: use `"command": "cmd", "args": ["/c", "npx", "-y", "publish-pilot-mcp"]` and restart Claude Desktop.
+- **`npm publish` fails with E429 `rate limited exceeded`**: npm limits how many packages and versions one account (or connection) can publish in about a day, and it doesn't say what the limit is. Nothing was published. Wait a few hours and try once. Retrying every few minutes can keep the limit active.
 - **The npm approval link expired**: ask Claude to call `publish_package` again. Each call opens a fresh link, and versions that are already published are skipped.
 - **The release workflow says the tag doesn't match the version**: the `v*` tag must equal the manifest version. Ask Claude to `bump_version`, commit, and tag the new version. Old tags are never moved.
 - **`npm publish` from Actions fails with 404 or 401**: trusted publishing isn't set up for this repo and `release.yml` yet. Run `setup_trusted_publishing` (the package must already exist on npm).

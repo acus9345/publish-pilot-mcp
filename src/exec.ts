@@ -216,6 +216,46 @@ export function startJob(cmd: string, args: readonly string[], opts: JobOptions)
   return job;
 }
 
+/** Quote a string for PowerShell (single quotes, '' escapes). */
+export function psQuote(text: string): string {
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+/** Quote a string for POSIX sh. */
+export function shQuote(text: string): string {
+  return /^[\w@%+=:,./-]+$/.test(text) ? text : `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Run a command that needs a real terminal (npm hides 2FA links and skips its approval
+ * prompt without one). Windows: a visible PowerShell window the user can see; the job ends
+ * with the window's exit code. macOS/Linux: the `script` utility provides a pseudo-terminal,
+ * so output is still captured and URLs are detected.
+ */
+export function startTerminalJob(cmd: string, args: readonly string[], opts: JobOptions & { intro?: string }): Job {
+  if (process.platform === "win32") {
+    const script = [
+      `$host.UI.RawUI.WindowTitle = ${psQuote(`publish-pilot: ${opts.label}`)}`,
+      ...(opts.cwd ? [`Set-Location -LiteralPath ${psQuote(opts.cwd)}`] : []),
+      `Write-Host ${psQuote(opts.intro ?? "publish-pilot started this command. Follow any prompt below.")} -ForegroundColor Yellow`,
+      `& ${[cmd, ...args].map(psQuote).join(" ")}`,
+      "$code = $LASTEXITCODE",
+      "if ($code -ne 0) { Read-Host 'It failed (see above). Press Enter to close' } else { Write-Host 'Done. This window closes in 5 seconds.' -ForegroundColor Green; Start-Sleep 5 }",
+      "exit $code",
+    ].join("\n");
+    const launcher =
+      "$p = Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$env:PP_ENCODED -PassThru -Wait; exit $p.ExitCode";
+    return startJob("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", launcher], {
+      ...opts,
+      env: { ...opts.env, PP_ENCODED: Buffer.from(script, "utf16le").toString("base64") },
+    });
+  }
+  const line = [cmd, ...args].map(shQuote).join(" ");
+  return process.platform === "darwin"
+    ? startJob("script", ["-q", "/dev/null", "/bin/sh", "-c", line], opts)
+    : startJob("script", ["-qec", line, "/dev/null"], opts);
+}
+
 export function getJob(id: string): Job | undefined {
   return jobs.get(id);
 }
