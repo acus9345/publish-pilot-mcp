@@ -22,6 +22,7 @@ describe("scaffoldProject", () => {
       author: "Ada Lovelace <ada@example.com>",
       publishConfig: { access: "public" },
       bin: { thing: "dist/cli.js" },
+      scripts: { typecheck: "tsc --noEmit" },
       repository: { url: "git+https://github.com/ada/thing.git" },
     });
     const license = await readFile(join(dir, "LICENSE"), "utf8");

@@ -12,6 +12,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `publish_package` with `dryRun` for PyPI runs `twine check` instead of uploading to TestPyPI.
 - `inspect_package` for PyPI now scans the sdist's files for secrets and junk; it skipped the scan before.
 - `setup_trusted_publishing` waits while npm is still processing a brand-new package (only the `0.0.0-stage` placeholder is listed), and `publish_package` says the first version can take a minute or two to appear.
+- Step output in `run_checks`, `inspect_package` and other tools keeps stdout and stderr in the order the command wrote them, instead of putting all of stderr (such as npm's notices) after the test results.
+
+### Changed
+
+- New npm projects from `scaffold_project` get a `typecheck` script (`tsc --noEmit`), so `run_checks` runs it instead of skipping it.
 
 ## [0.1.0] - 2026-10-17
 

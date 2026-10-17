@@ -71,7 +71,7 @@ function tail(text: string, chars = 3000): string {
 }
 
 function step(name: string, result: RunResult): StepResult {
-  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  const output = result.output;
   return { step: name, command: result.command, ok: result.ok, output: tail(result.timedOut ? `${output}\n(timed out)` : output) };
 }
 

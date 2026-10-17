@@ -9,6 +9,8 @@ export interface RunResult {
   exitCode: number | null;
   stdout: string;
   stderr: string;
+  /** stdout and stderr interleaved in the order the command wrote them. */
+  output: string;
   /** True when the command exited with code 0. */
   ok: boolean;
   /** True when the command could not start (usually: not installed). */
@@ -82,6 +84,7 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
+    let combined = "";
     let timedOut = false;
     let settled = false;
     let child: ChildProcess;
@@ -94,6 +97,7 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
         exitCode,
         stdout: cleanOutput(redact(stdout)).trim(),
         stderr: cleanOutput(redact(stderr)).trim(),
+        output: cleanOutput(redact(combined)).trim(),
         ok: exitCode === 0 && !timedOut,
         notFound,
         timedOut,
@@ -103,7 +107,7 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
       child = spawnProcess(cmd, args, opts);
     } catch (error) {
       stderr = String(error);
-      resolve({ command, exitCode: null, stdout, stderr, ok: false, notFound: true, timedOut });
+      resolve({ command, exitCode: null, stdout, stderr, output: stderr, ok: false, notFound: true, timedOut });
       return;
     }
     const timer = setTimeout(() => {
@@ -111,10 +115,17 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
       child.kill();
       finish(null);
     }, opts.timeoutMs ?? 120_000);
-    child.stdout?.on("data", (d: Buffer) => (stdout = append(stdout, d.toString())));
-    child.stderr?.on("data", (d: Buffer) => (stderr = append(stderr, d.toString())));
+    child.stdout?.on("data", (d: Buffer) => {
+      stdout = append(stdout, d.toString());
+      combined = append(combined, d.toString());
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      stderr = append(stderr, d.toString());
+      combined = append(combined, d.toString());
+    });
     child.on("error", (error: NodeJS.ErrnoException) => {
       stderr = append(stderr, error.message);
+      combined = append(combined, error.message);
       finish(null, error.code === "ENOENT");
     });
     child.on("close", (code) => {

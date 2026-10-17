@@ -10,6 +10,12 @@ describe("run", () => {
     expect(result).toMatchObject({ exitCode: 3, stdout: "hi", stderr: "warn", ok: false, notFound: false });
   });
 
+  it("keeps stdout and stderr in the order they were written", async () => {
+    const script = "process.stdout.write('one\\n'); setTimeout(() => { process.stderr.write('two\\n'); setTimeout(() => process.stdout.write('three\\n'), 50); }, 50);";
+    const result = await run(node, ["-e", script]);
+    expect(result.output).toBe("one\ntwo\nthree");
+  });
+
   it("reports a missing program instead of throwing", async () => {
     const result = await run("definitely-not-a-real-program-xyz", ["--version"]);
     expect(result.ok).toBe(false);

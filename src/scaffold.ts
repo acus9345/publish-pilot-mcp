@@ -162,7 +162,7 @@ function npmFiles(o: ScaffoldOptions, author: { name: string; email?: string }):
     exports: { ".": { types: "./dist/index.d.ts", import: "./dist/index.js" } },
     ...(o.cli ? { bin: { [bin]: "dist/cli.js" } } : {}),
     files: ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
-    scripts: { build: "tsc", test: 'npm run build && node --test "test/**/*.test.js"', prepack: "npm run build" },
+    scripts: { build: "tsc", typecheck: "tsc --noEmit", test: 'npm run build && node --test "test/**/*.test.js"', prepack: "npm run build" },
     engines: { node: ">=22" },
     ...(o.repoUrl
       ? { repository: { type: "git", url: `git+${o.repoUrl}.git` }, homepage: `${o.repoUrl}#readme`, bugs: { url: `${o.repoUrl}/issues` } }
