@@ -96,6 +96,7 @@ describe("MCP server", () => {
     await writeFile(join(dir, ".env"), "X=1");
     const result = await client.callTool({ name: "git_commit", arguments: { dir, message: "init" } });
     expect(JSON.parse(text(result))).toMatchObject({ ok: false, refused: true });
+    expect(result.isError).toBe(true);
   });
 
   it("bumps the version and changelog", async () => {

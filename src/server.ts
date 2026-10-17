@@ -31,12 +31,17 @@ import { VERSION } from "./version.js";
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
-/** Wrap a handler: JSON output, and friendly errors instead of stack traces. */
+/**
+ * Wrap a handler: JSON output, and friendly errors instead of stack traces. A result with
+ * `ok: false` (a failed check, push or verify) is flagged as an error so clients and the
+ * model don't read it as a success.
+ */
 function handler<A>(fn: (args: A) => Promise<unknown>): (args: A) => Promise<ToolResult> {
   return async (args: A) => {
     try {
       const value = await fn(args);
-      return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
+      const failed = Boolean(value) && typeof value === "object" && (value as { ok?: unknown }).ok === false;
+      return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }], ...(failed ? { isError: true } : {}) };
     } catch (error) {
       const message = error instanceof UserError || error instanceof TypeError || error instanceof Error ? error.message : String(error);
       return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };

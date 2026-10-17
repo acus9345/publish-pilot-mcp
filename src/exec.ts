@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { redact } from "./redact.js";
@@ -78,16 +78,68 @@ function append(buffer: string, chunk: string): string {
   return next.length > MAX_OUTPUT ? next.slice(next.length - MAX_OUTPUT) : next;
 }
 
+/** TextDecoder labels for the Windows console code pages TextDecoder supports. */
+const CODE_PAGE_LABELS: Record<number, string> = {
+  866: "ibm866",
+  874: "windows-874",
+  932: "shift_jis",
+  936: "gbk",
+  949: "euc-kr",
+  950: "big5",
+  1250: "windows-1250",
+  1251: "windows-1251",
+  1252: "windows-1252",
+  1253: "windows-1253",
+  1254: "windows-1254",
+  1255: "windows-1255",
+  1256: "windows-1256",
+  1257: "windows-1257",
+  1258: "windows-1258",
+};
+
+let consoleCodePage: number | null | undefined;
+
+/** The Windows console (OEM) code page, e.g. 950 on Chinese (Hong Kong) Windows. `null` when unknown. */
+function windowsCodePage(): number | null {
+  if (consoleCodePage !== undefined) return consoleCodePage;
+  const result = spawnSync("cmd.exe", ["/d", "/c", "chcp"], { encoding: "latin1", windowsHide: true, timeout: 5000 });
+  const match = /(\d+)\s*$/.exec(String(result.stdout ?? "").trim());
+  consoleCodePage = match ? Number(match[1]) : null;
+  return consoleCodePage;
+}
+
+/**
+ * Decode a command's output. Most tools write UTF-8, but on non-English Windows, Windows
+ * PowerShell 5.1 and other console programs write the console code page (950 for Chinese (Hong
+ * Kong)), which reads as garbage when decoded as UTF-8. Invalid UTF-8 is decoded with that code page.
+ */
+export function decodeOutput(bytes: Buffer, codePage?: number): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    const page = codePage ?? (IS_WINDOWS ? windowsCodePage() : null);
+    const label = page ? CODE_PAGE_LABELS[page] : undefined;
+    return label ? new TextDecoder(label).decode(bytes) : bytes.toString("utf8");
+  }
+}
+
 /** Run a command to completion. Never throws; failures are reported in the result. */
 export function run(cmd: string, args: readonly string[] = [], opts: RunOptions = {}): Promise<RunResult> {
   const command = formatCommand(cmd, args);
   return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let combined = "";
+    // Raw chunks in arrival order, decoded once at the end so multi-byte characters split across chunks survive.
+    const chunks: { err: boolean; data: Buffer }[] = [];
+    let bytes = 0;
     let timedOut = false;
     let settled = false;
     let child: ChildProcess;
+    const collect = (err: boolean, data: Buffer): void => {
+      chunks.push({ err, data });
+      bytes += data.length;
+      while (bytes > MAX_OUTPUT && chunks.length > 1) bytes -= chunks.shift()!.data.length;
+    };
+    const text = (pick: (c: { err: boolean }) => boolean): string =>
+      cleanOutput(redact(decodeOutput(Buffer.concat(chunks.filter(pick).map((c) => c.data))))).trim();
     const finish = (exitCode: number | null, notFound = false): void => {
       if (settled) return;
       settled = true;
@@ -95,9 +147,9 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
       resolve({
         command,
         exitCode,
-        stdout: cleanOutput(redact(stdout)).trim(),
-        stderr: cleanOutput(redact(stderr)).trim(),
-        output: cleanOutput(redact(combined)).trim(),
+        stdout: text((c) => !c.err),
+        stderr: text((c) => c.err),
+        output: text(() => true),
         ok: exitCode === 0 && !timedOut,
         notFound,
         timedOut,
@@ -106,8 +158,8 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
     try {
       child = spawnProcess(cmd, args, opts);
     } catch (error) {
-      stderr = String(error);
-      resolve({ command, exitCode: null, stdout, stderr, output: stderr, ok: false, notFound: true, timedOut });
+      const stderr = String(error);
+      resolve({ command, exitCode: null, stdout: "", stderr, output: stderr, ok: false, notFound: true, timedOut });
       return;
     }
     const timer = setTimeout(() => {
@@ -115,17 +167,10 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
       child.kill();
       finish(null);
     }, opts.timeoutMs ?? 120_000);
-    child.stdout?.on("data", (d: Buffer) => {
-      stdout = append(stdout, d.toString());
-      combined = append(combined, d.toString());
-    });
-    child.stderr?.on("data", (d: Buffer) => {
-      stderr = append(stderr, d.toString());
-      combined = append(combined, d.toString());
-    });
+    child.stdout?.on("data", (d: Buffer) => collect(false, d));
+    child.stderr?.on("data", (d: Buffer) => collect(true, d));
     child.on("error", (error: NodeJS.ErrnoException) => {
-      stderr = append(stderr, error.message);
-      combined = append(combined, error.message);
+      collect(true, Buffer.from(error.message));
       finish(null, error.code === "ENOENT");
     });
     child.on("close", (code) => {
@@ -138,11 +183,51 @@ export function run(cmd: string, args: readonly string[] = [], opts: RunOptions 
   });
 }
 
-/** Run a whole command line through the platform shell (PowerShell on Windows, sh elsewhere). */
-export function runShell(commandLine: string, opts: RunOptions = {}): Promise<RunResult> {
-  return IS_WINDOWS
-    ? run("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", commandLine], opts)
-    : run("/bin/sh", ["-c", commandLine], opts);
+/**
+ * Rewrite `a && b` for Windows PowerShell 5.1, which has no `&&` (only PowerShell 7 does): run each
+ * part only if the previous one succeeded, and exit with its exit code if it failed. `&&` inside
+ * quotes is left alone.
+ */
+export function powershell51Command(commandLine: string): string {
+  const parts: string[] = [];
+  let quote: string | null = null;
+  let start = 0;
+  for (let i = 0; i < commandLine.length; i++) {
+    const ch = commandLine[i]!;
+    if (quote) {
+      if (ch === quote) quote = null;
+    } else if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === "&" && commandLine[i + 1] === "&") {
+      parts.push(commandLine.slice(start, i).trim());
+      start = i + 2;
+      i++;
+    }
+  }
+  parts.push(commandLine.slice(start).trim());
+  if (parts.length === 1) return commandLine;
+  return parts.join("; if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }; ");
+}
+
+/** Make PowerShell write UTF-8 so its own messages decode correctly whatever the Windows language. */
+const POWERSHELL_UTF8 = "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}; $OutputEncoding = [System.Text.Encoding]::UTF8; ";
+
+let pwshAvailable: Promise<boolean> | undefined;
+
+/** Whether PowerShell 7 (pwsh) is installed. It supports `&&` and UTF-8 natively. */
+function hasPwsh(): Promise<boolean> {
+  pwshAvailable ??= run("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.Major"], { timeoutMs: 20_000 }).then((r) => r.ok);
+  return pwshAvailable;
+}
+
+/**
+ * Run a whole command line through the platform shell: PowerShell on Windows (PowerShell 7 when
+ * installed, else Windows PowerShell 5.1 with `&&` rewritten), sh elsewhere.
+ */
+export async function runShell(commandLine: string, opts: RunOptions = {}): Promise<RunResult> {
+  if (!IS_WINDOWS) return run("/bin/sh", ["-c", commandLine], opts);
+  const flags = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
+  if (await hasPwsh()) return run("pwsh", [...flags, POWERSHELL_UTF8 + commandLine], opts);
+  return run("powershell.exe", [...flags, POWERSHELL_UTF8 + powershell51Command(commandLine)], opts);
 }
 
 // ---------------------------------------------------------------------------
