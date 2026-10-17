@@ -258,11 +258,18 @@ async function packageOnRegistry(name: string): Promise<boolean | null> {
 
 const APPROVAL_URL = /^https:\/\/(www\.)?npmjs\.com\/(login|auth)\//i;
 
+/** npm's default debug-log folder (inside its cache). */
+function defaultNpmLogsDir(): string {
+  return process.platform === "win32"
+    ? join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "npm-cache", "_logs")
+    : join(homedir(), ".npm", "_logs");
+}
+
 /**
  * The error lines of the newest npm debug log written since `since`. A visible window's output
  * can't be captured, so this is how the job learns why npm failed. One-time auth ids are hidden.
  */
-export async function npmLogErrors(since: number, logsDir = join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "npm-cache", "_logs")): Promise<string | undefined> {
+export async function npmLogErrors(since: number, logsDir = defaultNpmLogsDir()): Promise<string | undefined> {
   if (!existsSync(logsDir)) return undefined;
   const logs = [];
   for (const name of await readdir(logsDir)) {
@@ -292,14 +299,15 @@ function npmApprovalJob(args: string[], dir: string | undefined, label: string, 
     onUrl: (url) => {
       if (openBrowser && APPROVAL_URL.test(url)) void openUrl(url);
     },
-    finalize: process.platform === "win32" ? () => npmLogErrors(startedAt) : undefined,
+    // Visible windows (Windows, macOS) can't be captured; read npm's own log instead.
+    finalize: process.platform === "linux" ? undefined : () => npmLogErrors(startedAt),
   });
 }
 
 const WINDOW_NOTE =
-  process.platform === "win32"
-    ? "A PowerShell window opened for this step. If npm shows 'Press ENTER to open in the browser', press Enter in that window, then approve on npmjs.com."
-    : "If an npm page opened in the browser, approve it there.";
+  process.platform === "linux"
+    ? "If an npm page opened in the browser, approve it there."
+    : `A ${process.platform === "win32" ? "PowerShell" : "Terminal"} window opened for this step. If npm shows 'Press ENTER to open in the browser', press Enter in that window, then approve on npmjs.com.`;
 
 /** Wait briefly for an approval URL / device code, then describe the job. */
 async function settle(job: Job, seconds = 25): Promise<Record<string, unknown>> {

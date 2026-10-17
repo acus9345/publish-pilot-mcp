@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { redact } from "./redact.js";
 
 /** Result of a finished command. Output is already redacted. */
@@ -240,9 +242,9 @@ export function shQuote(text: string): string {
 
 /**
  * Run a command that needs a real terminal (npm hides 2FA links and skips its approval
- * prompt without one). Windows: a visible PowerShell window the user can see; the job ends
- * with the window's exit code. macOS/Linux: the `script` utility provides a pseudo-terminal,
- * so output is still captured and URLs are detected.
+ * prompt without one). Windows: a visible PowerShell window; macOS: a Terminal window. On both,
+ * the job ends with the window's exit code. Linux: the `script` utility provides a
+ * pseudo-terminal, so output is still captured and URLs are detected.
  */
 export function startTerminalJob(cmd: string, args: readonly string[], opts: JobOptions & { intro?: string }): Job {
   if (process.platform === "win32") {
@@ -263,9 +265,24 @@ export function startTerminalJob(cmd: string, args: readonly string[], opts: Job
     });
   }
   const line = [cmd, ...args].map(shQuote).join(" ");
-  return process.platform === "darwin"
-    ? startJob("script", ["-q", "/dev/null", "/bin/sh", "-c", line], opts)
-    : startJob("script", ["-qec", line, "/dev/null"], opts);
+  if (process.platform === "darwin") {
+    // macOS script(1) needs a terminal on its own stdin, which an MCP server never has,
+    // so open a Terminal window and wait for the exit code it writes.
+    const resultFile = join(tmpdir(), `publish-pilot-${process.pid}-${Date.now()}.exit`);
+    const inWindow = [
+      ...(opts.cwd ? [`cd ${shQuote(opts.cwd)}`] : []),
+      `echo ${shQuote(opts.intro ?? "publish-pilot started this command. Follow any prompt below.")}`,
+      line,
+      `echo $? > ${shQuote(resultFile)}`,
+    ].join("; ");
+    const waiter = [
+      `osascript -e 'on run argv' -e 'tell application "Terminal"' -e 'activate' -e 'do script (item 1 of argv)' -e 'end tell' -e 'end run' "$PP_SCRIPT" > /dev/null || exit 1`,
+      `while [ ! -s ${shQuote(resultFile)} ]; do sleep 1; done`,
+      `exit "$(cat ${shQuote(resultFile)})"`,
+    ].join("\n");
+    return startJob("/bin/sh", ["-c", waiter], { ...opts, env: { ...opts.env, PP_SCRIPT: inWindow } });
+  }
+  return startJob("script", ["-qec", line, "/dev/null"], opts);
 }
 
 export function getJob(id: string): Job | undefined {

@@ -12,6 +12,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Support for npm, PyPI and crates.io, with GitHub Actions CI and tag-triggered release workflows that use trusted publishing (OIDC) and skip versions that already exist.
 - Safety rails: token redaction on all output, secret scanning before commits and publishes, refusal of destructive commands, and browser pages limited to github.com, npmjs.com, pypi.org and crates.io.
 - `publish-pilot-mcp` CLI with `--help`, `--version` and `doctor`.
-- npm login, publish and trust steps run in a real terminal (a visible PowerShell window on Windows, `script` on macOS/Linux), because npm only shows its 2FA approval link there.
+- npm login, publish and trust steps run in a real terminal (a visible PowerShell window on Windows, a Terminal window on macOS, `script` on Linux), because npm only shows its 2FA approval link there.
 - `job_status` explains rate limits (E429), versions that already exist, rejected names and expired approval links.
 - After an E429, `publish_package` waits 24 hours before trying again (unless forced), because every failed attempt can extend npm's block.

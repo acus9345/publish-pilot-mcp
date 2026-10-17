@@ -86,7 +86,8 @@ describe("quoting", () => {
   });
 });
 
-describe.runIf(process.platform !== "win32")("startTerminalJob (pseudo-terminal)", () => {
+// Windows and macOS open a visible window instead, which CI can't drive.
+describe.runIf(process.platform === "linux")("startTerminalJob (pseudo-terminal)", () => {
   it("runs the command with a TTY and captures output", async () => {
     const job = startTerminalJob(node, ["-e", "console.log(process.stdout.isTTY ? 'tty' : 'pipe')"], { label: "tty test" });
     await waitForJob(job, 15_000);

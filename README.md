@@ -57,7 +57,7 @@ The server never types passwords or 2FA codes and never clicks Authorize, Approv
 - Approve the first `npm publish` on npmjs.com (2FA).
 - Approve the trusted-publisher link (`npm trust github`) with 2FA. If you prefer the website, open the package's **Settings → Trusted Publisher** page and fill in the values Claude gives you.
 
-npm only shows its approval link in a real terminal. So on Windows these npm steps run in a visible PowerShell window: if it says "Press ENTER to open in the browser", press Enter there and approve. On macOS and Linux they run under `script`, which gives npm a terminal, and the page opens in your browser.
+npm only shows its approval link in a real terminal. So on Windows and macOS these npm steps run in a visible PowerShell or Terminal window: if it says "Press ENTER to open in the browser", press Enter there and approve. On Linux they run under `script`, which gives npm a terminal, and the page opens in your browser.
 
 npm can only add a trusted publisher to a package that already exists, so a brand-new package is published once from your machine and every later version from GitHub Actions.
 
