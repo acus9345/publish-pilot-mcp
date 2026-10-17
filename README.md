@@ -122,7 +122,7 @@ node dist/cli.js --help
 
 - **`doctor` says a tool is MISSING**: ask Claude to run `install_tool`, or install it yourself (for example `winget install --id GitHub.cli -e`). Then restart your MCP client so it picks up the new PATH.
 - **Claude Desktop on Windows can't start the server**: use `"command": "cmd", "args": ["/c", "npx", "-y", "publish-pilot-mcp"]` and restart Claude Desktop.
-- **`npm publish` fails with E429 `rate limited exceeded`**: npm limits how many packages and versions one account (or connection) can publish in about a day, and it doesn't say what the limit is. Nothing was published. Wait a few hours and try once. Retrying every few minutes can keep the limit active.
+- **`npm publish` fails with E429 `rate limited exceeded`**: npm limits how many packages and versions one account can publish, and it doesn't say what the limit is. Nothing was published. **Don't retry soon: every failed attempt can extend the block.** `publish_package` records the failure in `~/.publish-pilot/rate-limits.json` and refuses to try again for 24 hours (unless called with `force`). Wait, or ask npm to lift it at https://www.npmjs.com/support.
 - **The npm approval link expired**: ask Claude to call `publish_package` again. Each call opens a fresh link, and versions that are already published are skipped.
 - **The release workflow says the tag doesn't match the version**: the `v*` tag must equal the manifest version. Ask Claude to `bump_version`, commit, and tag the new version. Old tags are never moved.
 - **`npm publish` from Actions fails with 404 or 401**: trusted publishing isn't set up for this repo and `release.yml` yet. Run `setup_trusted_publishing` (the package must already exist on npm).

@@ -2,7 +2,7 @@ import { utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { startJob, waitForJob } from "../src/exec.js";
-import { npmLogErrors } from "../src/ops.js";
+import { lastRateLimit, npmLogErrors, publishPackage, recordRateLimit } from "../src/ops.js";
 import { tempDir } from "./helpers.js";
 
 const LOG = [
@@ -32,6 +32,29 @@ describe("npmLogErrors", () => {
 
   it("returns undefined when there is no log", async () => {
     expect(await npmLogErrors(Date.now(), join(await tempDir(), "missing"))).toBeUndefined();
+  });
+});
+
+describe("rate-limit guard", () => {
+  it("records and reads the last E429 per package", async () => {
+    const file = join(await tempDir(), "nested", "rate-limits.json");
+    expect(await lastRateLimit("npm:x", file)).toBeNull();
+    const when = new Date("2026-10-17T15:01:00Z");
+    await recordRateLimit("npm:x", when, file);
+    await recordRateLimit("npm:y", new Date(), file);
+    expect((await lastRateLimit("npm:x", file))?.toISOString()).toBe(when.toISOString());
+  });
+
+  it("publish_package refuses within 24 hours of an E429 and says when to try", async () => {
+    const dir = await tempDir();
+    const name = `pp-never-published-${Date.now()}`;
+    await writeFile(join(dir, "package.json"), JSON.stringify({ name, version: "0.1.0" }));
+    const file = join(dir, "limits.json");
+    await recordRateLimit(`npm:${name}`, new Date(Date.now() - 60 * 60 * 1000), file);
+    const result = await publishPackage(dir, { rateLimitFile: file, openBrowser: false });
+    expect(result).toMatchObject({ skipped: true, rateLimited: true });
+    expect(String(result.reason)).toMatch(/can extend the block/);
+    expect(new Date(String(result.retryAfter)).getTime()).toBeGreaterThan(Date.now() + 22 * 60 * 60 * 1000);
   });
 });
 

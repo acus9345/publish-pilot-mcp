@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { addChangelogEntry, bumpSemver, changelogSection, readManifest, writeManifestVersion, type BumpLevel, type ManifestKind } from "./changelog.js";
 import { openUrl } from "./desktop.js";
 import { describeJob, run, runShell, startJob, startTerminalJob, waitForJob, type Job, type RunResult } from "./exec.js";
@@ -348,12 +348,52 @@ export async function startLogin(service: "github" | Registry, openBrowser = tru
   };
 }
 
-/** Publish the package in `dir`. Skips when the version is already on the registry. */
-export async function publishPackage(dir: string, opts: { dryRun?: boolean; openBrowser?: boolean } = {}): Promise<Record<string, unknown>> {
+/** How long to stay away from the registry after an E429. Every failed attempt can extend npm's block. */
+export const RATE_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const RATE_LIMIT_FILE = join(homedir(), ".publish-pilot", "rate-limits.json");
+const RATE_LIMITED = /E429|Too Many Requests|rate limit/i;
+
+/** When the registry last rate-limited publishing of `key` (e.g. "npm:my-pkg"), if recorded. */
+export async function lastRateLimit(key: string, file = RATE_LIMIT_FILE): Promise<Date | null> {
+  try {
+    const value = (JSON.parse(await readFile(file, "utf8")) as Record<string, string>)[key];
+    return value ? new Date(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Remember that publishing `key` was rate-limited at `when`. */
+export async function recordRateLimit(key: string, when = new Date(), file = RATE_LIMIT_FILE): Promise<void> {
+  let data: Record<string, string> = {};
+  try {
+    data = JSON.parse(await readFile(file, "utf8")) as Record<string, string>;
+  } catch {
+    // first record
+  }
+  data[key] = when.toISOString();
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+/** Publish the package in `dir`. Skips when the version is already on the registry or a recent E429 says to wait. */
+export async function publishPackage(dir: string, opts: { dryRun?: boolean; openBrowser?: boolean; force?: boolean; rateLimitFile?: string } = {}): Promise<Record<string, unknown>> {
   const manifest = await requireManifest(dir);
   const exists = await versionExists(manifest.kind, manifest.name, manifest.version);
   if (exists && !opts.dryRun) {
     return { skipped: true, reason: `${manifest.name}@${manifest.version} is already published. Bump the version (bump_version) to publish again.` };
+  }
+  const limitKey = `${manifest.kind}:${manifest.name}`;
+  const limitedAt = await lastRateLimit(limitKey, opts.rateLimitFile);
+  if (limitedAt && !opts.dryRun && !opts.force && Date.now() - limitedAt.getTime() < RATE_LIMIT_COOLDOWN_MS) {
+    const retryAfter = new Date(limitedAt.getTime() + RATE_LIMIT_COOLDOWN_MS);
+    return {
+      skipped: true,
+      rateLimited: true,
+      lastRateLimit: limitedAt.toISOString(),
+      retryAfter: retryAfter.toISOString(),
+      reason: `The registry rate-limited publishing ${manifest.name} at ${limitedAt.toISOString()}. Every failed attempt can extend the block, so publish-pilot waits 24 hours before trying again (after ${retryAfter.toISOString()}). Pass force: true only if the block is known to be lifted (for example, npm support confirmed it).`,
+    };
   }
   const auth = await authFor(manifest.kind);
   if (!auth.loggedIn && !opts.dryRun) throw new UserError(`${auth.detail} Then call publish_package again.`);
@@ -362,13 +402,18 @@ export async function publishPackage(dir: string, opts: { dryRun?: boolean; open
     const args = ["publish", ...(manifest.name.startsWith("@") ? ["--access", "public"] : []), ...(opts.dryRun ? ["--dry-run"] : [])];
     const label = `npm publish ${manifest.name}@${manifest.version}`;
     const job = opts.dryRun ? startJob("npm", args, { cwd: dir, label }) : npmApprovalJob(args, dir, label, openBrowser);
+    if (!opts.dryRun) {
+      void waitForJob(job, RATE_LIMIT_COOLDOWN_MS).then(() => {
+        if (job.exitCode !== 0 && RATE_LIMITED.test(job.output)) void recordRateLimit(limitKey, new Date(), opts.rateLimitFile);
+      });
+    }
     const info = await settle(job, 40);
     return {
       ...info,
       package: manifest.name,
       version: manifest.version,
       forUser: job.running
-        ? `${WINDOW_NOTE} Poll job_status; if it ends with an expired/401 error, call publish_package again for a fresh link. On E429 (rate limit) wait instead of retrying quickly: repeated attempts can keep the limit active.`
+        ? `${WINDOW_NOTE} Poll job_status; if it ends with an expired/401 error, call publish_package again for a fresh link. Never retry after E429 (rate limit): each failed attempt can extend the block.`
         : undefined,
     };
   }

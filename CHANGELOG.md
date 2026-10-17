@@ -14,3 +14,4 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `publish-pilot-mcp` CLI with `--help`, `--version` and `doctor`.
 - npm login, publish and trust steps run in a real terminal (a visible PowerShell window on Windows, `script` on macOS/Linux), because npm only shows its 2FA approval link there.
 - `job_status` explains rate limits (E429), versions that already exist, rejected names and expired approval links.
+- After an E429, `publish_package` waits 24 hours before trying again (unless forced), because every failed attempt can extend npm's block.
