@@ -510,23 +510,36 @@ interface RunInfo {
   url: string;
   displayTitle: string;
   headBranch: string;
+  headSha: string;
   event: string;
 }
 
-/** Wait for the latest run of a workflow and report the result; includes failing logs on failure. */
+/** Pick the run to report: for `ref` (branch or tag) if given, and for commit `sha` if given. */
+export function pickRun(runs: RunInfo[], ref?: string, sha?: string): RunInfo | undefined {
+  return runs.find((r) => (!ref || r.headBranch === ref) && (!sha || r.headSha === sha));
+}
+
+/**
+ * Wait for the run of a workflow for the folder's current commit (HEAD) and report the result,
+ * with failing logs on failure. Matching the commit avoids reporting the previous run while
+ * GitHub has not listed a just-pushed one yet.
+ */
 export async function watchWorkflow(dir: string, workflow = RELEASE_WORKFLOW_FILE, waitSeconds = 50, ref?: string): Promise<Record<string, unknown>> {
   const deadline = Date.now() + waitSeconds * 1000;
+  const head = await run("git", ["rev-parse", "HEAD"], { cwd: dir });
+  const sha = head.ok ? head.stdout.trim() : undefined;
   let latest: RunInfo | undefined;
   for (;;) {
-    const args = ["run", "list", "--workflow", workflow, "--limit", "5", "--json", "databaseId,status,conclusion,url,displayTitle,headBranch,event"];
+    const args = ["run", "list", "--workflow", workflow, "--limit", "20", "--json", "databaseId,status,conclusion,url,displayTitle,headBranch,headSha,event"];
     const list = await run("gh", args, { cwd: dir, timeoutMs: 30_000 });
     if (!list.ok) throw new UserError(`Could not list workflow runs: ${list.stderr || list.stdout}. Check that the repo exists on GitHub and gh is logged in.`);
-    const runs = JSON.parse(list.stdout || "[]") as RunInfo[];
-    latest = ref ? runs.find((r) => r.headBranch === ref) : runs[0];
+    latest = pickRun(JSON.parse(list.stdout || "[]") as RunInfo[], ref, sha);
     if (latest?.status === "completed" || Date.now() >= deadline) break;
     await new Promise((resolve) => setTimeout(resolve, Math.min(10_000, Math.max(0, deadline - Date.now()))));
   }
-  if (!latest) return { found: false, hint: `No runs of ${workflow} yet${ref ? ` for ${ref}` : ""}. It can take a few seconds to appear after a push; call again.` };
+  if (!latest) {
+    return { found: false, commit: sha, hint: `No run of ${workflow} for commit ${sha?.slice(0, 7) ?? "HEAD"}${ref ? ` on ${ref}` : ""} yet. Runs can take a few seconds to appear after a push; call again. If it never appears, check the workflow's 'on:' triggers.` };
+  }
   const result: Record<string, unknown> = { found: true, ...latest };
   if (latest.status !== "completed") result.hint = "Still running. Call watch_workflow again.";
   else if (latest.conclusion !== "success") {

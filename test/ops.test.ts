@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractJson, parsePackJson, prependPath } from "../src/ops.js";
+import { extractJson, parsePackJson, pickRun, prependPath } from "../src/ops.js";
 
 const entry = { name: "pkg", size: 10, unpackedSize: 20, files: [{ path: "a]b.js", size: 1 }] };
 
@@ -26,6 +26,20 @@ describe("parsePackJson", () => {
 
   it("returns null for unrelated JSON", () => {
     expect(parsePackJson('{"error": "x"}')).toBeNull();
+  });
+});
+
+describe("pickRun", () => {
+  const base = { status: "completed", conclusion: "success", url: "", displayTitle: "", event: "push", databaseId: 1 };
+  const runs = [
+    { ...base, databaseId: 2, headBranch: "main", headSha: "old" },
+    { ...base, databaseId: 3, headBranch: "v0.1.0", headSha: "new" },
+  ];
+  it("matches the commit, not just the newest run", () => {
+    expect(pickRun(runs, "main", "new")).toBeUndefined();
+    expect(pickRun(runs, undefined, "new")?.databaseId).toBe(3);
+    expect(pickRun(runs, "main")?.databaseId).toBe(2);
+    expect(pickRun([], "main", "x")).toBeUndefined();
   });
 });
 
