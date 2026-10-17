@@ -243,6 +243,17 @@ export async function gitCommit(dir: string, message: string): Promise<Record<st
   return { ok: commit.ok, commit: head.stdout, steps };
 }
 
+/**
+ * What to do when the repo name is already taken on GitHub: push when this folder's origin is that
+ * repo; connect and push when it is empty and the folder has no origin (a create_github_repo that was
+ * interrupted after gh made the repo); otherwise refuse, so an unrelated repo is never touched.
+ */
+export function existingRepoAction(origin: string | null, url: string, isEmpty: boolean | null): "push" | "connect" | "refuse" {
+  const same = (a: string): boolean => a.replace(/\.git$/, "").replace(/\/$/, "").toLowerCase() === url.toLowerCase();
+  if (origin) return same(origin) ? "push" : "refuse";
+  return isEmpty === true ? "connect" : "refuse";
+}
+
 /** Create the GitHub repo from the local folder and push. Refuses to touch an existing repo it didn't create. */
 export async function createGithubRepo(dir: string, name: string, visibility: "public" | "private", description?: string): Promise<Record<string, unknown>> {
   const auth = await authFor("github");
@@ -254,9 +265,19 @@ export async function createGithubRepo(dir: string, name: string, visibility: "p
   const check = await checkRepoName(owner, name);
   const url = `https://github.com/${owner}/${name}`;
   if (check.available === false) {
-    if (remote.ok && remote.stdout.replace(/\.git$/, "").toLowerCase() === url.toLowerCase()) {
+    const view = remote.ok ? null : await run("gh", ["repo", "view", `${owner}/${name}`, "--json", "isEmpty", "--jq", ".isEmpty"], { cwd: dir, timeoutMs: 30_000 });
+    const isEmpty = view?.ok ? view.stdout.trim() === "true" : null;
+    const action = existingRepoAction(remote.ok ? remote.stdout : null, url, isEmpty);
+    const steps: StepResult[] = [];
+    if (action === "connect") {
+      const add = await run("git", ["remote", "add", "origin", `${url}.git`], { cwd: dir });
+      steps.push(step("git remote add origin", add));
+      if (!add.ok) return { ok: false, url, steps };
+    }
+    if (action !== "refuse") {
       const push = await run("git", ["push", "-u", "origin", "HEAD"], { cwd: dir, timeoutMs: 300_000 });
-      return { ok: push.ok, alreadyExisted: true, url, steps: [step("git push", push)] };
+      steps.push(step("git push", push));
+      return { ok: push.ok, alreadyExisted: true, ...(action === "connect" ? { reusedEmptyRepo: true } : {}), url, steps };
     }
     throw new UserError(`${check.reason ?? "That repo name is not available."} Pick another name (for example ${name}-kit) and call create_github_repo again.`);
   }

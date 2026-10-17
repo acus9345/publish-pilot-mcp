@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { currentDistFiles, extractJson, npmPackageState, parsePackJson, pickRun, prependPath } from "../src/ops.js";
+import { currentDistFiles, existingRepoAction, extractJson, npmPackageState, parsePackJson, pickRun, prependPath } from "../src/ops.js";
 
 const entry = { name: "pkg", size: 10, unpackedSize: 20, files: [{ path: "a]b.js", size: 1 }] };
 
@@ -79,5 +79,23 @@ describe("npmPackageState", () => {
   it("treats no versions as not published", () => {
     expect(npmPackageState({ versions: {} })).toBe(false);
     expect(npmPackageState(null)).toBe(false);
+  });
+});
+
+describe("existingRepoAction", () => {
+  const url = "https://github.com/ada/thing";
+
+  it("pushes when origin is already that repo", () => {
+    expect(existingRepoAction("https://github.com/Ada/thing.git", url, null)).toBe("push");
+  });
+
+  it("connects an empty repo when the folder has no origin (an interrupted create)", () => {
+    expect(existingRepoAction(null, url, true)).toBe("connect");
+  });
+
+  it("refuses a repo with history, an unknown state, or a different origin", () => {
+    expect(existingRepoAction(null, url, false)).toBe("refuse");
+    expect(existingRepoAction(null, url, null)).toBe("refuse");
+    expect(existingRepoAction("https://github.com/ada/other.git", url, true)).toBe("refuse");
   });
 });

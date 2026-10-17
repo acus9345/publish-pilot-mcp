@@ -311,7 +311,7 @@ export function createServer(): McpServer {
     "create_github_repo",
     {
       title: "Create the GitHub repo and push",
-      description: "gh repo create <name> --public|--private --source=. --push. Needs a commit and a GitHub login. If the repo already exists and is this folder's origin, just pushes.",
+      description: "gh repo create <name> --public|--private --source=. --push. Needs a commit and a GitHub login. If the repo already exists and is this folder's origin, just pushes; if it exists, is empty and the folder has no origin (an earlier create was interrupted), connects and pushes.",
       inputSchema: {
         dir: dirArg,
         name: z.string().describe("Repo name (without owner)."),
