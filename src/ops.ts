@@ -1,0 +1,503 @@
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { addChangelogEntry, bumpSemver, changelogSection, readManifest, writeManifestVersion, type BumpLevel, type ManifestKind } from "./changelog.js";
+import { openUrl } from "./desktop.js";
+import { describeJob, run, runShell, startJob, waitForJob, type Job, type RunResult } from "./exec.js";
+import { checkRepoName, githubLogin } from "./names.js";
+import { authFor, type Registry } from "./preflight.js";
+import { scanFiles, scanProject, type SecretFinding } from "./secrets.js";
+import { RELEASE_WORKFLOW_FILE } from "./workflows.js";
+
+/** Thrown for problems the user (or model) can fix; the message says how. */
+export class UserError extends Error {}
+
+export interface StepResult {
+  step: string;
+  command: string;
+  ok: boolean;
+  skipped?: boolean;
+  output: string;
+}
+
+interface PackResult {
+  files: { path: string; size: number }[];
+  size: number;
+  unpackedSize: number;
+}
+
+/** Normalise `npm pack --json` output: an array in npm ≤ 11, an object keyed by package name in npm 12+. */
+export function parsePackJson(text: string): PackResult | null {
+  const value = extractJson(text);
+  const items = Array.isArray(value) ? value : value && typeof value === "object" ? ("files" in value ? [value] : Object.values(value)) : [];
+  const first = items.find((item): item is PackResult => Boolean(item) && typeof item === "object" && Array.isArray((item as PackResult).files));
+  return first ?? null;
+}
+
+/** Pull the first complete top-level JSON object or array out of mixed output (npm prints script logs around it). */
+export function extractJson(text: string): unknown {
+  const opener = /[[{]/g;
+  for (let match = opener.exec(text); match; match = opener.exec(text)) {
+    const start = match.index;
+    let depth = 0;
+    let inString = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (ch === "\\") i++;
+        else if (ch === '"') inString = false;
+      } else if (ch === '"') inString = true;
+      else if (ch === "[" || ch === "{") depth++;
+      else if (ch === "]" || ch === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const value: unknown = JSON.parse(text.slice(start, i + 1));
+            if (value && typeof value === "object") return value;
+          } catch {
+            // not JSON; try the next opener
+          }
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function tail(text: string, chars = 3000): string {
+  return text.length > chars ? `…${text.slice(-chars)}` : text;
+}
+
+function step(name: string, result: RunResult): StepResult {
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  return { step: name, command: result.command, ok: result.ok, output: tail(result.timedOut ? `${output}\n(timed out)` : output) };
+}
+
+async function requireManifest(dir: string): Promise<{ kind: ManifestKind; name: string; version: string }> {
+  if (!existsSync(dir)) throw new UserError(`The folder ${dir} does not exist. Pass the project folder as 'dir'.`);
+  const manifest = await readManifest(dir);
+  if (!manifest) throw new UserError(`No package.json, pyproject.toml or Cargo.toml in ${dir}. Run scaffold_project first or pass the right folder.`);
+  if (!manifest.name) throw new UserError(`The manifest in ${dir} has no name. Add a "name" field.`);
+  return manifest;
+}
+
+/** Path to the Python inside the project's .venv, creating the venv when needed. */
+async function venvPython(dir: string): Promise<{ python: string; created?: StepResult }> {
+  const python = process.platform === "win32" ? join(dir, ".venv", "Scripts", "python.exe") : join(dir, ".venv", "bin", "python");
+  if (existsSync(python)) return { python };
+  const created = await run(process.platform === "win32" ? "python" : "python3", ["-m", "venv", ".venv"], { cwd: dir, timeoutMs: 180_000 });
+  return { python, created: step("create virtualenv", created) };
+}
+
+/** Install, lint, build and test. Stops at the first failing step. */
+export async function runChecks(dir: string): Promise<{ ok: boolean; steps: StepResult[] }> {
+  const manifest = await requireManifest(dir);
+  const steps: StepResult[] = [];
+  const go = async (name: string, cmd: string, args: string[], timeoutMs = 600_000): Promise<boolean> => {
+    const result = step(name, await run(cmd, args, { cwd: dir, timeoutMs }));
+    steps.push(result);
+    return result.ok;
+  };
+  if (manifest.kind === "npm") {
+    const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8")) as { scripts?: Record<string, string> };
+    const scripts = pkg.scripts ?? {};
+    const installArgs = existsSync(join(dir, "package-lock.json")) ? ["ci"] : ["install"];
+    if (!(await go("install", "npm", installArgs))) return { ok: false, steps };
+    for (const script of ["lint", "typecheck", "build", "test"]) {
+      if (!scripts[script]) {
+        steps.push({ step: script, command: `npm run ${script}`, ok: true, skipped: true, output: `No "${script}" script in package.json.` });
+        continue;
+      }
+      if (!(await go(script, "npm", ["run", script]))) return { ok: false, steps };
+    }
+    return { ok: true, steps };
+  }
+  if (manifest.kind === "pypi") {
+    const { python, created } = await venvPython(dir);
+    if (created) {
+      steps.push(created);
+      if (!created.ok) return { ok: false, steps };
+    }
+    if (!(await go("install", python, ["-m", "pip", "install", "--upgrade", "pip", "-e", ".", "pytest", "build", "twine"]))) return { ok: false, steps };
+    if (!(await go("test", python, ["-m", "pytest"]))) return { ok: false, steps };
+    if (!(await go("build", python, ["-m", "build"]))) return { ok: false, steps };
+    return { ok: true, steps };
+  }
+  const clippy = await run("cargo", ["clippy", "--all-targets", "--", "-D", "warnings"], { cwd: dir, timeoutMs: 600_000 });
+  steps.push({ ...step("lint (clippy)", clippy), ...(clippy.ok ? {} : /no such command|not installed/i.test(clippy.stderr) ? { ok: true, skipped: true } : {}) });
+  if (!steps[0]!.ok) return { ok: false, steps };
+  if (!(await go("build", "cargo", ["build"]))) return { ok: false, steps };
+  if (!(await go("test", "cargo", ["test"]))) return { ok: false, steps };
+  return { ok: true, steps };
+}
+
+const JUNK = /(^|\/)(\.env(\..*)?|.*\.log|\.DS_Store|Thumbs\.db|node_modules\/.*|coverage\/.*|\.nyc_output\/.*|.*\.tgz|\.npmrc|\.pypirc|\.vscode\/.*|\.idea\/.*)$/i;
+
+/** List what would be published, flag junk and secrets, and run the registry's dry run. */
+export async function inspectPackage(dir: string): Promise<Record<string, unknown>> {
+  const manifest = await requireManifest(dir);
+  let files: string[] = [];
+  const steps: StepResult[] = [];
+  if (manifest.kind === "npm") {
+    const pack = await run("npm", ["pack", "--dry-run", "--json"], { cwd: dir, timeoutMs: 300_000 });
+    steps.push({ ...step("npm pack --dry-run", pack), output: pack.ok ? "(file list parsed below)" : tail(pack.stderr) });
+    const parsed = pack.ok ? parsePackJson(pack.stdout) : null;
+    if (pack.ok && !parsed) steps.push({ step: "parse file list", command: "", ok: false, output: tail(pack.stdout) });
+    if (parsed) {
+      files = parsed.files.map((f) => f.path);
+      steps.push({ step: "size", command: "", ok: true, output: `${parsed.size} bytes packed, ${parsed.unpackedSize} bytes unpacked, ${files.length} files` });
+    }
+    steps.push(step("npm publish --dry-run", await run("npm", ["publish", "--dry-run", ...(manifest.name.startsWith("@") ? ["--access", "public"] : [])], { cwd: dir, timeoutMs: 300_000 })));
+  } else if (manifest.kind === "pypi") {
+    const { python, created } = await venvPython(dir);
+    if (created) steps.push(created);
+    steps.push(step("install build tools", await run(python, ["-m", "pip", "install", "--upgrade", "build", "twine"], { cwd: dir, timeoutMs: 300_000 })));
+    steps.push(step("build", await run(python, ["-m", "build"], { cwd: dir, timeoutMs: 300_000 })));
+    const dist = existsSync(join(dir, "dist")) ? (await readdir(join(dir, "dist"))).map((f) => `dist/${f}`) : [];
+    steps.push(step("twine check", await run(python, ["-m", "twine", "check", ...dist], { cwd: dir, timeoutMs: 120_000 })));
+    for (const archive of dist.filter((f) => f.endsWith(".whl"))) {
+      const list = await run(python, ["-m", "zipfile", "-l", archive], { cwd: dir });
+      files.push(...list.stdout.split(/\r?\n/).slice(1).map((l) => l.trim().split(/\s+/)[0] ?? "").filter(Boolean));
+    }
+  } else {
+    const list = await run("cargo", ["package", "--list", "--allow-dirty"], { cwd: dir, timeoutMs: 300_000 });
+    steps.push({ ...step("cargo package --list", list), output: list.ok ? "(file list parsed below)" : tail(list.stderr) });
+    files = list.stdout.split(/\r?\n/).filter(Boolean);
+    steps.push(step("cargo publish --dry-run", await run("cargo", ["publish", "--dry-run", "--allow-dirty"], { cwd: dir, timeoutMs: 600_000 })));
+  }
+  const junk = files.filter((f) => JUNK.test(f.replace(/\\/g, "/")));
+  const secrets: SecretFinding[] = manifest.kind === "pypi" ? [] : await scanFiles(dir, files.filter((f) => existsSync(join(dir, f))));
+  const problems = [
+    ...junk.map((f) => `Junk file would be published: ${f}. Exclude it ("files" in package.json, .npmignore, or the manifest's include/exclude).`),
+    ...secrets.map((s) => `Possible secret (${s.kind}) in ${s.file}${s.line ? `:${s.line}` : ""}. Remove it before publishing.`),
+    ...steps.filter((s) => !s.ok).map((s) => `Step failed: ${s.step}. See its output.`),
+  ];
+  return { package: manifest.name, version: manifest.version, ok: problems.length === 0, problems, files, steps };
+}
+
+/** `git init` (branch main) when needed, refuse if secrets would be committed, then commit everything. */
+export async function gitCommit(dir: string, message: string): Promise<Record<string, unknown>> {
+  if (!message.trim()) throw new UserError("The commit message is empty. Pass a short message such as 'Initial commit'.");
+  const steps: StepResult[] = [];
+  if (!existsSync(join(dir, ".git"))) {
+    const init = await run("git", ["init", "-b", "main"], { cwd: dir });
+    steps.push(step("git init", init));
+    if (!init.ok) return { ok: false, steps };
+  }
+  if (!existsSync(join(dir, ".gitignore"))) throw new UserError("There is no .gitignore. Add one (scaffold_project creates it) so node_modules, build output and .env files are not committed.");
+  const findings = await scanProject(dir);
+  if (findings.length > 0) {
+    return {
+      ok: false,
+      refused: true,
+      reason: "Possible secrets would be committed. Remove them or add the files to .gitignore, then try again.",
+      findings,
+    };
+  }
+  steps.push(step("git add", await run("git", ["add", "-A"], { cwd: dir })));
+  const staged = await run("git", ["diff", "--cached", "--quiet"], { cwd: dir });
+  if (staged.ok) return { ok: true, nothingToCommit: true, steps };
+  const commit = await run("git", ["commit", "-m", message], { cwd: dir });
+  steps.push(step("git commit", commit));
+  const head = await run("git", ["rev-parse", "--short", "HEAD"], { cwd: dir });
+  return { ok: commit.ok, commit: head.stdout, steps };
+}
+
+/** Create the GitHub repo from the local folder and push. Refuses to touch an existing repo it didn't create. */
+export async function createGithubRepo(dir: string, name: string, visibility: "public" | "private", description?: string): Promise<Record<string, unknown>> {
+  const auth = await authFor("github");
+  if (!auth.loggedIn) throw new UserError(`${auth.detail} The repo can be created once you are logged in.`);
+  const owner = await githubLogin();
+  if (!owner) throw new UserError("Could not read your GitHub username from gh. Run `gh auth status` to check the login.");
+  if (!existsSync(join(dir, ".git"))) throw new UserError("This folder is not a git repo yet. Run git_commit first.");
+  const remote = await run("git", ["remote", "get-url", "origin"], { cwd: dir });
+  const check = await checkRepoName(owner, name);
+  const url = `https://github.com/${owner}/${name}`;
+  if (check.available === false) {
+    if (remote.ok && remote.stdout.replace(/\.git$/, "").toLowerCase() === url.toLowerCase()) {
+      const push = await run("git", ["push", "-u", "origin", "HEAD"], { cwd: dir, timeoutMs: 300_000 });
+      return { ok: push.ok, alreadyExisted: true, url, steps: [step("git push", push)] };
+    }
+    throw new UserError(`${check.reason ?? "That repo name is not available."} Pick another name (for example ${name}-kit) and call create_github_repo again.`);
+  }
+  const args = ["repo", "create", name, `--${visibility}`, "--source", ".", "--remote", "origin", "--push"];
+  if (description) args.push("--description", description);
+  const create = await run("gh", args, { cwd: dir, timeoutMs: 300_000 });
+  return { ok: create.ok, url, visibility, steps: [step("gh repo create", create)] };
+}
+
+/** Is `name@version` already on the registry? `null` when unknown. */
+export async function versionExists(kind: ManifestKind, name: string, version: string): Promise<boolean | null> {
+  const url =
+    kind === "npm"
+      ? `https://registry.npmjs.org/${name.replace("/", "%2F")}/${version}`
+      : kind === "pypi"
+        ? `https://pypi.org/pypi/${name}/${version}/json`
+        : `https://crates.io/api/v1/crates/${name}/${version}`;
+  try {
+    const response = await fetch(url, { headers: { "User-Agent": "publish-pilot-mcp" }, signal: AbortSignal.timeout(15_000) });
+    if (response.status === 404) return false;
+    return response.ok ? true : null;
+  } catch {
+    return null;
+  }
+}
+
+const APPROVAL_URL = /^https:\/\/(www\.)?npmjs\.com\/(login|auth)\//i;
+
+function jobWithBrowser(cmd: string, args: string[], dir: string | undefined, label: string, openBrowser: boolean): Job {
+  return startJob(cmd, args, {
+    cwd: dir,
+    label,
+    timeoutMs: 0,
+    onUrl: (url) => {
+      if (openBrowser && APPROVAL_URL.test(url)) void openUrl(url);
+    },
+  });
+}
+
+/** Wait briefly for an approval URL / device code, then describe the job. */
+async function settle(job: Job, seconds = 25): Promise<Record<string, unknown>> {
+  await waitForJob(job, seconds * 1000, (j) => j.urls.some((u) => /npmjs\.com\/(login|auth)|github\.com\/login\/device/.test(u)) || j.codes.length > 0);
+  return describeJob(job);
+}
+
+/** Start a browser login for a service. Returns a job to poll with job_status. */
+export async function startLogin(service: "github" | Registry, openBrowser = true): Promise<Record<string, unknown>> {
+  const auth = await authFor(service);
+  if (auth.loggedIn) return { alreadyLoggedIn: true, ...auth };
+  if (service === "github") {
+    const job = startJob("gh", ["auth", "login", "--hostname", "github.com", "--web", "--git-protocol", "https", "--skip-ssh-key"], { label: "GitHub login" });
+    await waitForJob(job, 20_000, (j) => j.codes.length > 0);
+    // gh waits for Enter before it opens the browser and starts polling.
+    job.child.stdin?.write("\n");
+    job.child.on("close", (code) => {
+      if (code === 0) void run("gh", ["auth", "setup-git"]);
+    });
+    await waitForJob(job, 3_000);
+    return {
+      ...describeJob(job),
+      forUser: `Open https://github.com/login/device, enter the code ${job.codes[0] ?? "(see outputTail)"}, then sign in and click Authorize. Poll job_status until running is false.`,
+    };
+  }
+  if (service === "npm") {
+    const job = jobWithBrowser("npm", ["login", "--auth-type=web", "--registry", "https://registry.npmjs.org/"], undefined, "npm login", openBrowser);
+    return { ...(await settle(job)), forUser: "Sign in on the npm page that opened (and complete 2FA). Poll job_status until running is false." };
+  }
+  if (service === "pypi") {
+    const page = "https://pypi.org/manage/account/publishing/";
+    if (openBrowser) await openUrl(page);
+    return {
+      started: false,
+      page,
+      forUser:
+        "PyPI needs no local login with trusted publishing: add a pending publisher on this page (owner, repo, workflow release.yml) and the release workflow publishes. For manual uploads instead, create an API token at https://pypi.org/manage/account/token/ and save it in ~/.pypirc yourself.",
+    };
+  }
+  const page = "https://crates.io/settings/tokens/new";
+  if (openBrowser) await openUrl(page);
+  return {
+    started: false,
+    page,
+    forUser: "Create a token with the publish-new and publish-update scopes on this page, then run `cargo login` in your own terminal and paste it there. Never paste the token into chat.",
+  };
+}
+
+/** Publish the package in `dir`. Skips when the version is already on the registry. */
+export async function publishPackage(dir: string, opts: { dryRun?: boolean; openBrowser?: boolean } = {}): Promise<Record<string, unknown>> {
+  const manifest = await requireManifest(dir);
+  const exists = await versionExists(manifest.kind, manifest.name, manifest.version);
+  if (exists && !opts.dryRun) {
+    return { skipped: true, reason: `${manifest.name}@${manifest.version} is already published. Bump the version (bump_version) to publish again.` };
+  }
+  const auth = await authFor(manifest.kind);
+  if (!auth.loggedIn && !opts.dryRun) throw new UserError(`${auth.detail} Then call publish_package again.`);
+  const openBrowser = opts.openBrowser ?? true;
+  if (manifest.kind === "npm") {
+    const args = ["publish", ...(manifest.name.startsWith("@") ? ["--access", "public"] : []), ...(opts.dryRun ? ["--dry-run"] : [])];
+    const job = jobWithBrowser("npm", args, dir, `npm publish ${manifest.name}@${manifest.version}`, openBrowser);
+    const info = await settle(job, 40);
+    return {
+      ...info,
+      package: manifest.name,
+      version: manifest.version,
+      forUser: job.running
+        ? "Approve the publish on the npm page that opened (2FA). Poll job_status; if the job ends with an expired/401 error, call publish_package again for a fresh link."
+        : undefined,
+    };
+  }
+  if (manifest.kind === "pypi") {
+    const { python } = await venvPython(dir);
+    const dist = existsSync(join(dir, "dist")) ? (await readdir(join(dir, "dist"))).map((f) => `dist/${f}`) : [];
+    if (dist.length === 0) throw new UserError("dist/ is empty. Run run_checks (it builds) or inspect_package first.");
+    const job = startJob(python, ["-m", "twine", "upload", "--non-interactive", ...(opts.dryRun ? ["--repository", "testpypi"] : []), ...dist], { cwd: dir, label: "twine upload" });
+    return { ...(await settle(job, 60)), package: manifest.name, version: manifest.version };
+  }
+  const job = startJob("cargo", ["publish", ...(opts.dryRun ? ["--dry-run"] : [])], { cwd: dir, label: "cargo publish" });
+  return { ...(await settle(job, 60)), package: manifest.name, version: manifest.version };
+}
+
+/** Connect the package to the GitHub release workflow with trusted publishing (OIDC). */
+export async function setupTrustedPublishing(dir: string, repo: string, workflowFile = RELEASE_WORKFLOW_FILE, openBrowser = true): Promise<Record<string, unknown>> {
+  const manifest = await requireManifest(dir);
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new UserError(`'${repo}' is not in owner/name form, for example octocat/my-tool.`);
+  const [owner, repoName] = repo.split("/") as [string, string];
+  const values = { owner, repository: repoName, workflow: workflowFile, environment: "(leave empty)" };
+  if (manifest.kind === "npm") {
+    const exists = await versionExists("npm", manifest.name, manifest.version);
+    const page = `https://www.npmjs.com/package/${manifest.name}/access`;
+    if (exists === false) {
+      return { ok: false, reason: "npm needs the package to exist before trusted publishing can be set. Publish the first version with publish_package, then call this again.", page, values };
+    }
+    const job = jobWithBrowser("npm", ["trust", "github", manifest.name, "--repository", repo, "--file", workflowFile, "--allow-publish", "--yes"], dir, "npm trust github", openBrowser);
+    const info = await settle(job, 40);
+    return {
+      ...info,
+      page,
+      values,
+      forUser: "Approve on the npm page that opened (2FA). If the npm CLI cannot do it, open the page above, choose GitHub Actions under Trusted Publisher, fill in the values and click Save.",
+    };
+  }
+  if (manifest.kind === "pypi") {
+    const exists = await versionExists("pypi", manifest.name, manifest.version);
+    const page = exists === false ? "https://pypi.org/manage/account/publishing/" : `https://pypi.org/manage/project/${manifest.name}/settings/publishing/`;
+    if (openBrowser) await openUrl(page);
+    return { ok: true, page, values: { "PyPI project name": manifest.name, ...values }, forUser: "Fill in these values in the GitHub tab of the form on the page that opened, then click Add." };
+  }
+  const page = `https://crates.io/crates/${manifest.name}/settings`;
+  if (openBrowser) await openUrl(page);
+  return { ok: true, page, values, forUser: "Under Trusted Publishing add a GitHub configuration with these values, then save. The crate must already exist (publish 0.1.0 once with publish_package)." };
+}
+
+/** Tag `v<version>` (from the manifest unless given), push branch and tag, optionally create the GitHub release. */
+export async function tagAndRelease(dir: string, opts: { version?: string; createRelease?: boolean } = {}): Promise<Record<string, unknown>> {
+  const manifest = await requireManifest(dir);
+  const version = (opts.version ?? manifest.version).replace(/^v/, "");
+  if (version !== manifest.version) throw new UserError(`The manifest says ${manifest.version} but you asked for ${version}. Run bump_version first so they match.`);
+  const tag = `v${version}`;
+  const steps: StepResult[] = [];
+  const status = await run("git", ["status", "--porcelain"], { cwd: dir });
+  if (status.stdout) throw new UserError("There are uncommitted changes. Commit them with git_commit before tagging.");
+  const existing = await run("git", ["rev-parse", "-q", "--verify", `refs/tags/${tag}`], { cwd: dir });
+  if (!existing.ok) steps.push(step("git tag", await run("git", ["tag", "-a", tag, "-m", tag], { cwd: dir })));
+  steps.push(step("push branch", await run("git", ["push", "origin", "HEAD"], { cwd: dir, timeoutMs: 300_000 })));
+  steps.push(step("push tag", await run("git", ["push", "origin", tag], { cwd: dir, timeoutMs: 300_000 })));
+  if (opts.createRelease) {
+    const view = await run("gh", ["release", "view", tag], { cwd: dir });
+    if (view.ok) steps.push({ step: "gh release create", command: "", ok: true, skipped: true, output: `Release ${tag} already exists.` });
+    else {
+      const changelog = existsSync(join(dir, "CHANGELOG.md")) ? await readFile(join(dir, "CHANGELOG.md"), "utf8") : "";
+      const notes = changelogSection(changelog, version) ?? `Release ${tag}`;
+      const notesFile = join(await mkdtemp(join(tmpdir(), "publish-pilot-")), "notes.md");
+      await writeFile(notesFile, notes);
+      steps.push(step("gh release create", await run("gh", ["release", "create", tag, "--title", tag, "--notes-file", notesFile, "--verify-tag"], { cwd: dir, timeoutMs: 120_000 })));
+    }
+  }
+  const remote = await run("git", ["remote", "get-url", "origin"], { cwd: dir });
+  return { ok: steps.every((s) => s.ok), tag, repo: remote.stdout.replace(/\.git$/, ""), steps };
+}
+
+interface RunInfo {
+  databaseId: number;
+  status: string;
+  conclusion: string;
+  url: string;
+  displayTitle: string;
+  headBranch: string;
+  event: string;
+}
+
+/** Wait for the latest run of a workflow and report the result; includes failing logs on failure. */
+export async function watchWorkflow(dir: string, workflow = RELEASE_WORKFLOW_FILE, waitSeconds = 50, ref?: string): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + waitSeconds * 1000;
+  let latest: RunInfo | undefined;
+  for (;;) {
+    const args = ["run", "list", "--workflow", workflow, "--limit", "5", "--json", "databaseId,status,conclusion,url,displayTitle,headBranch,event"];
+    const list = await run("gh", args, { cwd: dir, timeoutMs: 30_000 });
+    if (!list.ok) throw new UserError(`Could not list workflow runs: ${list.stderr || list.stdout}. Check that the repo exists on GitHub and gh is logged in.`);
+    const runs = JSON.parse(list.stdout || "[]") as RunInfo[];
+    latest = ref ? runs.find((r) => r.headBranch === ref) : runs[0];
+    if (latest?.status === "completed" || Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(10_000, Math.max(0, deadline - Date.now()))));
+  }
+  if (!latest) return { found: false, hint: `No runs of ${workflow} yet${ref ? ` for ${ref}` : ""}. It can take a few seconds to appear after a push; call again.` };
+  const result: Record<string, unknown> = { found: true, ...latest };
+  if (latest.status !== "completed") result.hint = "Still running. Call watch_workflow again.";
+  else if (latest.conclusion !== "success") {
+    const logs = await run("gh", ["run", "view", String(latest.databaseId), "--log-failed"], { cwd: dir, timeoutMs: 60_000 });
+    result.failedLog = tail(logs.stdout || logs.stderr, 6000);
+    result.hint = "Fix the cause, then bump_version (patch), commit, and tag_and_release the new version. Never delete or move the old tag.";
+  }
+  return result;
+}
+
+/** Bump the manifest version and add a CHANGELOG entry. Does not commit. */
+export async function bumpVersion(dir: string, level: BumpLevel, notes: string): Promise<Record<string, unknown>> {
+  const manifest = await requireManifest(dir);
+  const next = bumpSemver(manifest.version, level);
+  const changed = await writeManifestVersion(dir, next);
+  const changelogPath = join(dir, "CHANGELOG.md");
+  const current = existsSync(changelogPath) ? await readFile(changelogPath, "utf8") : "# Changelog\n";
+  await writeFile(changelogPath, addChangelogEntry(current, next, notes || "### Fixed\n\n- Maintenance release."));
+  changed.push("CHANGELOG.md");
+  if (manifest.kind === "crates") await run("cargo", ["update", "--workspace"], { cwd: dir, timeoutMs: 120_000 });
+  return { from: manifest.version, to: next, changed, next: "Commit with git_commit, then tag_and_release." };
+}
+
+/** Install from the real registry (or clone from GitHub) into a fresh temp folder and run a command there. */
+export async function verifyInstall(opts: {
+  registry?: Registry;
+  name?: string;
+  version?: string;
+  repoUrl?: string;
+  command: string;
+}): Promise<Record<string, unknown>> {
+  const dir = await mkdtemp(join(tmpdir(), "publish-pilot-verify-"));
+  const steps: StepResult[] = [];
+  const add = async (name: string, promise: Promise<RunResult>): Promise<boolean> => {
+    const result = step(name, await promise);
+    steps.push(result);
+    return result.ok;
+  };
+  if (opts.repoUrl) {
+    if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(opts.repoUrl.replace(/\.git$/, ""))) throw new UserError("repoUrl must look like https://github.com/owner/repo.");
+    if (!(await add("git clone", run("git", ["clone", opts.repoUrl, "project"], { cwd: dir, timeoutMs: 300_000 })))) return { ok: false, dir, steps };
+    const ok = await add("command", runShell(opts.command, { cwd: join(dir, "project"), timeoutMs: 600_000 }));
+    return { ok, dir: join(dir, "project"), steps };
+  }
+  if (!opts.registry || !opts.name) throw new UserError("Pass either repoUrl, or registry and name.");
+  const spec = opts.version ? `${opts.name}@${opts.version}` : opts.name;
+  if (opts.registry === "npm") {
+    if (!(await add("npm init", run("npm", ["init", "-y"], { cwd: dir })))) return { ok: false, dir, steps };
+    if (!(await add("npm install", run("npm", ["install", spec, "--registry", "https://registry.npmjs.org/"], { cwd: dir, timeoutMs: 300_000 })))) return { ok: false, dir, steps };
+  } else if (opts.registry === "pypi") {
+    const { python, created } = await venvPython(dir);
+    if (created) steps.push(created);
+    const pin = opts.version ? `${opts.name}==${opts.version}` : opts.name;
+    if (!(await add("pip install", run(python, ["-m", "pip", "install", "--no-cache-dir", pin], { cwd: dir, timeoutMs: 300_000 })))) return { ok: false, dir, steps };
+  } else {
+    if (!(await add("cargo new", run("cargo", ["new", "verify-app"], { cwd: dir, timeoutMs: 120_000 })))) return { ok: false, dir, steps };
+    if (!(await add("cargo add", run("cargo", ["add", opts.version ? `${opts.name}@${opts.version}` : opts.name], { cwd: join(dir, "verify-app"), timeoutMs: 300_000 })))) return { ok: false, dir, steps };
+  }
+  // Put the installed package's executables first on PATH so README commands work as written.
+  const binDir =
+    opts.registry === "npm"
+      ? join(dir, "node_modules", ".bin")
+      : opts.registry === "pypi"
+        ? join(dir, ".venv", process.platform === "win32" ? "Scripts" : "bin")
+        : undefined;
+  const ok = await add(
+    "command",
+    runShell(opts.command, { cwd: opts.registry === "crates" ? join(dir, "verify-app") : dir, timeoutMs: 600_000, env: binDir ? prependPath(binDir) : undefined }),
+  );
+  return { ok, dir, steps };
+}
+
+/** Environment with `dir` prepended to PATH, respecting Windows' case-insensitive "Path" key. */
+export function prependPath(dir: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  const separator = process.platform === "win32" ? ";" : ":";
+  return { [key]: env[key] ? `${dir}${separator}${env[key]}` : dir };
+}
