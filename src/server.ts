@@ -2,6 +2,8 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { notify, openUrl } from "./desktop.js";
 import { describeJob, getJob, listJobs, run, runShell, stopJob, waitForJob, writeToJob } from "./exec.js";
@@ -29,16 +31,39 @@ import { CI_WORKFLOW_FILE, RELEASE_WORKFLOW_FILE, ciWorkflow, releaseWorkflow, r
 import { VERSION } from "./version.js";
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
+type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
-/** Wrap a handler: JSON output, and friendly errors instead of stack traces. */
-function handler<A>(fn: (args: A) => Promise<unknown>): (args: A) => Promise<ToolResult> {
-  return async (args: A) => {
+/**
+ * Longest a single call waits for a job or workflow. Many MCP clients cancel a tool call after
+ * 60 seconds, so waiting tools return before that and say to call again.
+ */
+export const MAX_WAIT_SECONDS = 45;
+const PROGRESS_INTERVAL_MS = 15_000;
+
+/**
+ * Wrap a handler: JSON output, and friendly errors instead of stack traces. While the tool runs,
+ * it sends progress notifications when the client asked for them, so clients that extend their
+ * timeout on progress don't cancel long installs or builds.
+ */
+function handler<A>(fn: (args: A) => Promise<unknown>): (args: A, extra?: Extra) => Promise<ToolResult> {
+  return async (args: A, extra?: Extra) => {
+    const token = extra?._meta?.progressToken;
+    let ticks = 0;
+    const keepAlive =
+      token !== undefined && extra
+        ? setInterval(() => {
+            ticks += 1;
+            extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ticks, message: "Still working" } }).catch(() => undefined);
+          }, PROGRESS_INTERVAL_MS)
+        : undefined;
     try {
       const value = await fn(args);
       return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
     } catch (error) {
       const message = error instanceof UserError || error instanceof TypeError || error instanceof Error ? error.message : String(error);
       return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
+    } finally {
+      if (keepAlive) clearInterval(keepAlive);
     }
   };
 }
@@ -172,7 +197,13 @@ export function createServer(): McpServer {
       description: "Get the status and recent output of a login or publish job. Optionally wait up to waitSeconds for it to finish, or send Enter to it. Without an id, lists all jobs.",
       inputSchema: {
         id: z.string().optional().describe("Job id from login, publish_package or setup_trusted_publishing."),
-        waitSeconds: z.number().int().min(0).max(600).default(0).describe("Wait up to this long for the job to finish (keep under your client's tool timeout)."),
+        waitSeconds: z
+          .number()
+          .int()
+          .min(0)
+          .max(600)
+          .default(0)
+          .describe(`Wait up to this long for the job to finish. Capped at ${MAX_WAIT_SECONDS} s per call so the call returns before common 60 s client timeouts; call again while running is true.`),
         sendEnter: z.boolean().default(false).describe("Send Enter to the job (for 'Press ENTER' prompts)."),
         stop: z.boolean().default(false).describe("Stop the job (e.g. to restart a publish whose link expired)."),
       },
@@ -184,7 +215,7 @@ export function createServer(): McpServer {
       if (!job) throw new UserError(`No job with id ${id}. Call job_status without an id to list jobs.`);
       if (stop) stopJob(job);
       if (sendEnter) writeToJob(job, "\n");
-      await waitForJob(job, waitSeconds * 1000);
+      await waitForJob(job, Math.min(waitSeconds, MAX_WAIT_SECONDS) * 1000);
       const info = describeJob(job);
       const hint = jobHint(job.running, job.exitCode, job.output);
       if (hint) info.hint = hint;
@@ -388,11 +419,17 @@ export function createServer(): McpServer {
         dir: dirArg,
         workflow: z.string().default(RELEASE_WORKFLOW_FILE),
         ref: z.string().optional().describe("Only runs for this tag/branch, e.g. v0.1.1."),
-        waitSeconds: z.number().int().min(0).max(600).default(50),
+        waitSeconds: z
+          .number()
+          .int()
+          .min(0)
+          .max(600)
+          .default(50)
+          .describe(`Capped at ${MAX_WAIT_SECONDS} s per call so the call returns before common 60 s client timeouts; while the run is in progress, call again.`),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    handler(async ({ dir, workflow, ref, waitSeconds }) => watchWorkflow(abs(dir), workflow, waitSeconds, ref)),
+    handler(async ({ dir, workflow, ref, waitSeconds }) => watchWorkflow(abs(dir), workflow, Math.min(waitSeconds, MAX_WAIT_SECONDS), ref)),
   );
 
   server.registerTool(

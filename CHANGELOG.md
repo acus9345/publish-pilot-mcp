@@ -17,6 +17,7 @@ Found by using publish-pilot to create a private repo end to end.
 - `verify_install` takes a list of commands and stops at the first that fails. A single PowerShell line joined with `;` reported success whenever the last command passed, even when an earlier one failed.
 - `tag_and_release` no longer creates the GitHub release itself when `release.yml` already creates it on the tag.
 - `watch_workflow`'s description now says it matches the current commit.
+- `watch_workflow` and `job_status` cap each wait at 45 seconds and say to call again. A long wait (for example 480 s) was cancelled by MCP clients that time out tool calls after 60 seconds. Long-running tools also send progress notifications every 15 seconds when the client asks for them.
 
 ## [0.1.1] - 2026-10-18
 

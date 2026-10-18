@@ -2,8 +2,8 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createServer, jobHint } from "../src/server.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { MAX_WAIT_SECONDS, createServer, jobHint } from "../src/server.js";
 import { tempDir } from "./helpers.js";
 
 let client: Client;
@@ -113,6 +113,39 @@ describe("MCP server", () => {
     expect(jobHint(true, null, "E429")).toBeUndefined();
     expect(jobHint(false, 0, "E429")).toBeUndefined();
     expect(jobHint(false, 1, "something else")).toBeUndefined();
+  });
+
+  it("returns long waits before common 60-second client timeouts", async () => {
+    expect(MAX_WAIT_SECONDS).toBeLessThan(60);
+    const { tools } = await client.listTools();
+    for (const name of ["job_status", "watch_workflow"]) {
+      const schema = tools.find((t) => t.name === name)!.inputSchema as unknown as { properties: { waitSeconds: { description: string } } };
+      expect(schema.properties.waitSeconds.description).toMatch(/Capped at 45 s/);
+    }
+  });
+
+  it("sends progress notifications during long calls when asked", async () => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await createServer().connect(serverTransport);
+    const progressClient = new Client({ name: "progress", version: "0.0.0" });
+    await progressClient.connect(clientTransport);
+    const dir = await tempDir();
+    const updates: number[] = [];
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const call = progressClient.callTool(
+        { name: "run_command", arguments: { command: 'node -e "setTimeout(() => {}, 300)"', cwd: dir } },
+        undefined,
+        { onprogress: (p) => updates.push(p.progress) },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      vi.advanceTimersByTime(31_000);
+      await call;
+    } finally {
+      vi.useRealTimers();
+      await progressClient.close();
+    }
+    expect(updates).toEqual([1, 2]);
   });
 
   it("lists jobs (none yet)", async () => {
