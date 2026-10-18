@@ -56,6 +56,41 @@ describe("scaffoldProject", () => {
     expect(await readFile(join(dir, "src/lib.rs"), "utf8")).toContain("my_thing::greet");
   });
 
+  it("repo-only npm projects document clone-and-build and can't be published by accident", async () => {
+    const dir = await tempDir();
+    const result = await scaffoldProject({ ...base, dir, name: "@ada/thing", registry: "npm", repoUrl: "https://github.com/ada/thing", target: "repo", private: true });
+    const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
+    expect(pkg.private).toBe(true);
+    expect(pkg.publishConfig).toBeUndefined();
+    const readme = await readFile(join(dir, "README.md"), "utf8");
+    expect(readme).not.toContain("npm install @ada/thing");
+    expect(readme).toContain("git clone https://github.com/ada/thing.git");
+    expect(readme).toContain('from "./dist/index.js"');
+    expect(await readFile(join(dir, ".github/workflows/ci.yml"), "utf8")).toContain("os: [ubuntu-latest]");
+    const release = await readFile(join(dir, ".github/workflows/release.yml"), "utf8");
+    expect(release).toContain("gh release create");
+    expect(release).not.toContain("npm publish");
+    expect(result.written).toContain(".github/workflows/release.yml");
+  });
+
+  it("repo-only Python and Rust projects block registry uploads", async () => {
+    const py = await tempDir();
+    await scaffoldProject({ ...base, dir: py, name: "thing", registry: "pypi", target: "repo" });
+    expect(await readFile(join(py, "pyproject.toml"), "utf8")).toContain('"Private :: Do Not Upload"');
+    const rs = await tempDir();
+    await scaffoldProject({ ...base, dir: rs, name: "thing", registry: "crates", target: "repo", repoUrl: "https://github.com/ada/thing" });
+    expect(await readFile(join(rs, "Cargo.toml"), "utf8")).toContain("publish = false");
+    expect(await readFile(join(rs, "README.md"), "utf8")).toContain("cargo add thing --git https://github.com/ada/thing");
+  });
+
+  it("public package projects keep the full CI matrix and registry install", async () => {
+    const dir = await tempDir();
+    await scaffoldProject({ ...base, dir, name: "thing", registry: "npm", repoUrl: "https://github.com/ada/thing" });
+    expect(await readFile(join(dir, ".github/workflows/ci.yml"), "utf8")).toContain("macos-latest");
+    expect(await readFile(join(dir, "README.md"), "utf8")).toContain("npm install thing");
+    expect(JSON.parse(await readFile(join(dir, "package.json"), "utf8")).private).toBeUndefined();
+  });
+
   it("escapes quotes in descriptions", async () => {
     const dir = await tempDir();
     await scaffoldProject({ ...base, description: 'Say "hi"', dir, name: "q", registry: "pypi" });

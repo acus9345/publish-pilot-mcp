@@ -225,7 +225,19 @@ export async function createGithubRepo(dir: string, name: string, visibility: "p
   const args = ["repo", "create", name, `--${visibility}`, "--source", ".", "--remote", "origin", "--push"];
   if (description) args.push("--description", description);
   const create = await run("gh", args, { cwd: dir, timeoutMs: 300_000 });
-  return { ok: create.ok, url, visibility, steps: [step("gh repo create", create)] };
+  const costHint = visibility === "private" ? await privateCiCostHint(dir) : undefined;
+  return { ok: create.ok, url, visibility, steps: [step("gh repo create", create)], ...(costHint ? { costHint } : {}) };
+}
+
+/** For private repos, warn when ci.yml runs on Windows/macOS, which bill Actions minutes at 2x/10x. */
+export async function privateCiCostHint(dir: string): Promise<string | undefined> {
+  const file = join(dir, ".github", "workflows", "ci.yml");
+  if (!existsSync(file)) return undefined;
+  // Ignore comments: the Ubuntu-only workflow mentions the other runners in a comment.
+  const yaml = (await readFile(file, "utf8")).replace(/(^|\s)#.*$/gm, "$1");
+  const runners = ["windows-latest", "macos-latest"].filter((os) => yaml.includes(os));
+  if (runners.length === 0) return undefined;
+  return `This private repo's CI also runs on ${runners.join(" and ")}. Private repos pay for Actions minutes, and Windows minutes count 2x and macOS 10x, so each push costs several times an Ubuntu-only run. To run CI on Ubuntu only, call add_workflows with private: true and overwrite: true, then commit.`;
 }
 
 /** Is `name@version` already on the registry? `null` when unknown. */
@@ -475,7 +487,18 @@ export async function setupTrustedPublishing(dir: string, repo: string, workflow
   return { ok: true, page, values, forUser: "Under Trusted Publishing add a GitHub configuration with these values, then save. The crate must already exist (publish 0.1.0 once with publish_package)." };
 }
 
-/** Tag `v<version>` (from the manifest unless given), push branch and tag, optionally create the GitHub release. */
+/** True when .github/workflows/release.yml runs on tags and creates a GitHub release itself. */
+export async function releaseWorkflowCreatesRelease(dir: string): Promise<boolean> {
+  const file = join(dir, ".github", "workflows", RELEASE_WORKFLOW_FILE);
+  if (!existsSync(file)) return false;
+  const yaml = await readFile(file, "utf8");
+  return /\btags:/.test(yaml) && /gh release create|softprops\/action-gh-release|actions\/create-release/.test(yaml);
+}
+
+/**
+ * Tag `v<version>` (from the manifest unless given), push branch and tag, and create the GitHub
+ * release unless release.yml does it (or `createRelease` says otherwise).
+ */
 export async function tagAndRelease(dir: string, opts: { version?: string; createRelease?: boolean } = {}): Promise<Record<string, unknown>> {
   const manifest = await requireManifest(dir);
   const version = (opts.version ?? manifest.version).replace(/^v/, "");
@@ -488,7 +511,17 @@ export async function tagAndRelease(dir: string, opts: { version?: string; creat
   if (!existing.ok) steps.push(step("git tag", await run("git", ["tag", "-a", tag, "-m", tag], { cwd: dir })));
   steps.push(step("push branch", await run("git", ["push", "origin", "HEAD"], { cwd: dir, timeoutMs: 300_000 })));
   steps.push(step("push tag", await run("git", ["push", "origin", tag], { cwd: dir, timeoutMs: 300_000 })));
-  if (opts.createRelease) {
+  const workflowReleases = await releaseWorkflowCreatesRelease(dir);
+  const createRelease = opts.createRelease ?? !workflowReleases;
+  if (!createRelease) {
+    steps.push({
+      step: "gh release create",
+      command: "",
+      ok: true,
+      skipped: true,
+      output: workflowReleases ? "release.yml creates the GitHub release when the tag arrives; watch it with watch_workflow." : "Not requested.",
+    });
+  } else {
     const view = await run("gh", ["release", "view", tag], { cwd: dir });
     if (view.ok) steps.push({ step: "gh release create", command: "", ok: true, skipped: true, output: `Release ${tag} already exists.` });
     else {
@@ -573,13 +606,38 @@ export async function bumpVersion(dir: string, level: BumpLevel, notes: string):
   };
 }
 
-/** Install from the real registry (or clone from GitHub) into a fresh temp folder and run a command there. */
+/**
+ * Run commands one at a time in the platform shell, stopping at the first failure. A single
+ * PowerShell line joined with ';' would keep going after a failed command and report the last
+ * command's result, which hides failures.
+ */
+export async function runCommandList(commands: string | readonly string[], opts: { cwd: string; env?: NodeJS.ProcessEnv }): Promise<{ ok: boolean; steps: StepResult[]; hint?: string }> {
+  const list = typeof commands === "string" ? [commands] : [...commands];
+  const steps: StepResult[] = [];
+  for (const [index, command] of list.entries()) {
+    const result = step(list.length === 1 ? "command" : `command ${index + 1}/${list.length}`, await runShell(command, { cwd: opts.cwd, timeoutMs: 600_000, env: opts.env }));
+    steps.push(result);
+    if (!result.ok) {
+      const skipped = list.slice(index + 1);
+      if (skipped.length) steps.push({ step: "not run", command: skipped.join("\n"), ok: false, skipped: true, output: "Skipped because the command above failed." });
+      return { ok: false, steps };
+    }
+  }
+  const joined = typeof commands === "string" && /;|\n|&&/.test(commands);
+  return {
+    ok: true,
+    steps,
+    hint: joined ? "Only the last command's result counts in a joined command line. Pass a list of commands so each one is checked." : undefined,
+  };
+}
+
+/** Install from the real registry (or clone from GitHub) into a fresh temp folder and run commands there. */
 export async function verifyInstall(opts: {
   registry?: Registry;
   name?: string;
   version?: string;
   repoUrl?: string;
-  command: string;
+  command: string | string[];
 }): Promise<Record<string, unknown>> {
   const dir = await mkdtemp(join(tmpdir(), "publish-pilot-verify-"));
   const steps: StepResult[] = [];
@@ -590,9 +648,15 @@ export async function verifyInstall(opts: {
   };
   if (opts.repoUrl) {
     if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(opts.repoUrl.replace(/\.git$/, ""))) throw new UserError("repoUrl must look like https://github.com/owner/repo.");
-    if (!(await add("git clone", run("git", ["clone", opts.repoUrl, "project"], { cwd: dir, timeoutMs: 300_000 })))) return { ok: false, dir, steps };
-    const ok = await add("command", runShell(opts.command, { cwd: join(dir, "project"), timeoutMs: 600_000 }));
-    return { ok, dir: join(dir, "project"), steps };
+    if (!(await add("git clone", run("git", ["clone", opts.repoUrl, "project"], { cwd: dir, timeoutMs: 300_000 })))) {
+      const failed = steps[steps.length - 1]!;
+      if (/Authentication|could not read Username|not found|403/i.test(failed.output)) {
+        failed.output += "\nFor a private repo, git needs your GitHub login: run `gh auth setup-git` once, then try again.";
+      }
+      return { ok: false, dir, steps };
+    }
+    const result = await runCommandList(opts.command, { cwd: join(dir, "project") });
+    return { ok: result.ok, dir: join(dir, "project"), steps: [...steps, ...result.steps], hint: result.hint };
   }
   if (!opts.registry || !opts.name) throw new UserError("Pass either repoUrl, or registry and name.");
   const spec = opts.version ? `${opts.name}@${opts.version}` : opts.name;
@@ -615,11 +679,8 @@ export async function verifyInstall(opts: {
       : opts.registry === "pypi"
         ? join(dir, ".venv", process.platform === "win32" ? "Scripts" : "bin")
         : undefined;
-  const ok = await add(
-    "command",
-    runShell(opts.command, { cwd: opts.registry === "crates" ? join(dir, "verify-app") : dir, timeoutMs: 600_000, env: binDir ? prependPath(binDir) : undefined }),
-  );
-  return { ok, dir, steps };
+  const result = await runCommandList(opts.command, { cwd: opts.registry === "crates" ? join(dir, "verify-app") : dir, env: binDir ? prependPath(binDir) : undefined });
+  return { ok: result.ok, dir, steps: [...steps, ...result.steps], hint: result.hint };
 }
 
 /** Environment with `dir` prepended to PATH, respecting Windows' case-insensitive "Path" key. */

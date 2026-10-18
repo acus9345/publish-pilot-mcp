@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Found by using publish-pilot to create a private repo end to end.
+
+### Added
+
+- `scaffold_project` `target` option. Repo-only projects get a clone-and-build README and a manifest that blocks registry publishing (`"private": true` for npm, `publish = false` for Rust, the `Private :: Do Not Upload` classifier for PyPI).
+- `private` option for `scaffold_project` and `add_workflows`: CI runs on Ubuntu only, because private repos pay for Actions minutes and Windows/macOS minutes count 2×/10×. `create_github_repo` warns when a private repo's CI would use them.
+
+### Fixed
+
+- `verify_install` takes a list of commands and stops at the first that fails. A single PowerShell line joined with `;` reported success whenever the last command passed, even when an earlier one failed.
+- `tag_and_release` no longer creates the GitHub release itself when `release.yml` already creates it on the tag.
+- `watch_workflow`'s description now says it matches the current commit.
+
 ## [0.1.1] - 2026-10-18
 
 ### Fixed

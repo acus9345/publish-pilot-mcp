@@ -198,7 +198,7 @@ export function createServer(): McpServer {
     {
       title: "Scaffold a project",
       description:
-        "Create a standard project: source, tests, README, LICENSE, CHANGELOG, .gitignore, .gitattributes and a manifest (version 0.1.0, author from git config, repo URL, publishConfig for scoped npm). Adds CI and release workflows when repoUrl is set. Never overwrites existing files.",
+        "Create a standard project: source, tests, README, LICENSE, CHANGELOG, .gitignore, .gitattributes and a manifest (version 0.1.0, author from git config, repo URL, publishConfig for scoped npm). Adds CI and release workflows when repoUrl is set. For target 'repo' the README explains clone-and-build and the manifest blocks registry publishing; for private repos CI runs on Ubuntu only. Never overwrites existing files.",
       inputSchema: {
         dir: dirArg,
         name: z.string().describe("Package name."),
@@ -207,7 +207,9 @@ export function createServer(): McpServer {
         license: z.string().default("MIT").describe("SPDX license id."),
         repoUrl: z.string().regex(/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/).optional().describe("https://github.com/owner/repo"),
         cli: z.boolean().default(false).describe("Add a command-line entry point with --help and --version (npm, pypi)."),
-        workflows: z.enum(["none", "ci", "ci+release", "ci+repo-release"]).optional().describe("Default: ci+release when repoUrl is set."),
+        workflows: z.enum(["none", "ci", "ci+release", "ci+repo-release"]).optional().describe("Default with repoUrl: ci+release for target 'both', ci+repo-release for 'repo', ci for 'package'."),
+        target: targetArg.optional().describe("What will be published. Default 'both' when repoUrl is set, otherwise 'package'."),
+        private: z.boolean().default(false).describe("The GitHub repo will be private: CI runs on Ubuntu only to save paid Actions minutes."),
       },
       annotations: { destructiveHint: false },
     },
@@ -229,14 +231,15 @@ export function createServer(): McpServer {
         dir: dirArg,
         registry: registryArg.optional().describe("Omit for a repo-only project."),
         release: z.enum(["none", "registry", "github-only"]).default("registry").describe("registry: publish + GitHub release; github-only: just a GitHub release."),
+        private: z.boolean().default(false).describe("Private repo: CI runs on Ubuntu only (Windows minutes count 2x, macOS 10x)."),
         overwrite: z.boolean().default(false),
       },
       annotations: { destructiveHint: false },
     },
-    handler(async ({ dir, registry, release, overwrite }) => {
+    handler(async ({ dir, registry, release, private: isPrivate, overwrite }) => {
       const base = join(abs(dir), ".github", "workflows");
       const files: Record<string, string> = {};
-      if (registry) files[CI_WORKFLOW_FILE] = ciWorkflow(registry);
+      if (registry) files[CI_WORKFLOW_FILE] = ciWorkflow(registry, { lean: isPrivate });
       if (release === "registry") {
         if (!registry) throw new UserError("release 'registry' needs a registry. Use release 'github-only' for a repo-only project.");
         files[RELEASE_WORKFLOW_FILE] = releaseWorkflow(registry);
@@ -360,11 +363,15 @@ export function createServer(): McpServer {
     "tag_and_release",
     {
       title: "Tag, push and release",
-      description: "Create tag v<version> from the manifest, push the branch and tag, and optionally create the GitHub release with notes from CHANGELOG.md. Never moves or deletes tags.",
+      description:
+        "Create tag v<version> from the manifest, push the branch and tag, and create the GitHub release with notes from CHANGELOG.md unless the repo's release.yml already does that on tags. Never moves or deletes tags.",
       inputSchema: {
         dir: dirArg,
         version: z.string().optional().describe("Must match the manifest; defaults to it."),
-        createRelease: z.boolean().default(false).describe("Create the GitHub release here (repo-only projects). For 'both', release.yml creates it."),
+        createRelease: z
+          .boolean()
+          .optional()
+          .describe("Default: create the release here only when .github/workflows/release.yml doesn't create one. Pass true or false to force."),
       },
       annotations: { destructiveHint: false, openWorldHint: true },
     },
@@ -375,7 +382,8 @@ export function createServer(): McpServer {
     "watch_workflow",
     {
       title: "Watch a workflow run",
-      description: "Wait for the latest run of a workflow (default release.yml) and report its result, with the failing log on failure.",
+      description:
+        "Wait for the workflow run (default release.yml) for the folder's current commit, optionally on a branch or tag, and report its result with the failing log on failure. Matching the commit avoids reporting an older run right after a push.",
       inputSchema: {
         dir: dirArg,
         workflow: z.string().default(RELEASE_WORKFLOW_FILE),
@@ -391,7 +399,8 @@ export function createServer(): McpServer {
     "bump_version",
     {
       title: "Bump the version",
-      description: "Bump the manifest version (patch/minor/major) and add a CHANGELOG entry. Does not commit.",
+      description:
+        "Bump the manifest version (patch/minor/major) and record it in CHANGELOG.md: given notes become a new entry; without notes, a non-empty 'Unreleased' section becomes the new version. Does not commit.",
       inputSchema: {
         dir: dirArg,
         level: z.enum(["patch", "minor", "major"]).default("patch"),
@@ -406,13 +415,16 @@ export function createServer(): McpServer {
     "verify_install",
     {
       title: "Verify like a new user",
-      description: "In a brand-new temp folder, install the published package from the real registry (or git clone the repo) and run a command, such as the README quick start. Installed executables are on PATH.",
+      description:
+        "In a brand-new temp folder, install the published package from the real registry (or git clone the repo, private ones included) and run the README's commands one by one, stopping at the first that fails. Installed executables are on PATH.",
       inputSchema: {
         registry: registryArg.optional(),
         name: z.string().optional(),
         version: z.string().optional(),
         repoUrl: z.string().optional().describe("https://github.com/owner/repo — clone instead of installing."),
-        command: z.string().describe("Command to run in the folder (PowerShell on Windows, sh elsewhere)."),
+        command: z
+          .union([z.string(), z.array(z.string()).min(1)])
+          .describe("Commands to run in the folder (PowerShell on Windows, sh elsewhere). Prefer a list: each one must succeed before the next runs."),
       },
       annotations: { destructiveHint: false, openWorldHint: true },
     },

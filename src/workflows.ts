@@ -61,8 +61,24 @@ permissions:
   contents: read
 `;
 
+export interface CiOptions {
+  /**
+   * Ubuntu only. For private repos, which pay for Actions minutes: Windows minutes count
+   * 2x and macOS minutes 10x, so the full matrix costs about 13 times as much per push.
+   */
+  lean?: boolean;
+}
+
+const LEAN_NOTE = "    # Ubuntu only: this repo is private, and private repos pay for Actions minutes\n    # (Windows counts 2x, macOS 10x). Add windows-latest / macos-latest when you need them.\n";
+
 /** CI workflow: install, lint, build and test on every push and pull request. */
-export function ciWorkflow(registry: Registry): string {
+export function ciWorkflow(registry: Registry, options: CiOptions = {}): string {
+  const yaml = fullCiWorkflow(registry);
+  if (!options.lean) return yaml;
+  return yaml.replace(/( +)os: \[ubuntu-latest, windows-latest, macos-latest\]\n/, (_m, indent: string) => `${LEAN_NOTE.replace(/^ {4}/gm, indent)}${indent}os: [ubuntu-latest]\n`);
+}
+
+function fullCiWorkflow(registry: Registry): string {
   switch (registry) {
     case "npm":
       return `${header("CI", CI_ON, CI_PERMISSIONS)}

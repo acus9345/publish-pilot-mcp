@@ -18,8 +18,16 @@ export interface ScaffoldOptions {
   repoUrl?: string;
   /** Add a command-line entry point with --help and --version. */
   cli?: boolean;
-  /** Which GitHub workflows to add. Default: both when repoUrl is set. */
+  /** Which GitHub workflows to add. Default: CI plus the release workflow that fits `target` when repoUrl is set. */
   workflows?: "none" | "ci" | "ci+release" | "ci+repo-release";
+  /**
+   * What will be published. "repo" means GitHub only: the README explains clone-and-build
+   * instead of a registry install, and the manifest blocks accidental registry publishing.
+   * Default "both" when repoUrl is set, otherwise "package".
+   */
+  target?: "repo" | "package" | "both";
+  /** The GitHub repo will be private: CI runs on Ubuntu only, because private repos pay for Actions minutes. */
+  private?: boolean;
 }
 
 export interface ScaffoldResult {
@@ -105,36 +113,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 `;
 }
 
+/** The publish target, with defaults filled in. */
+export function scaffoldTarget(o: Pick<ScaffoldOptions, "target" | "repoUrl">): "repo" | "package" | "both" {
+  return o.target ?? (o.repoUrl ? "both" : "package");
+}
+
 function readme(o: ScaffoldOptions, mod: string): string {
-  const install =
-    o.registry === "npm" ? `npm install ${o.name}` : o.registry === "pypi" ? `pip install ${o.name}` : `cargo add ${o.name}`;
+  const repoOnly = scaffoldTarget(o) === "repo";
+  const clone = o.repoUrl ? `git clone ${o.repoUrl}.git\ncd ${o.repoUrl.split("/").pop()}\n` : "";
+  const build =
+    o.registry === "npm" ? "npm install\nnpm run build\nnpm test" : o.registry === "pypi" ? "python -m pip install -e . pytest\npython -m pytest" : "cargo build\ncargo test";
+  const install = repoOnly
+    ? `This project is not published to a package registry. Clone it and build it:\n\n\`\`\`sh\n${clone}${o.registry === "npm" ? "npm install\nnpm run build" : o.registry === "pypi" ? "python -m pip install -e ." : "cargo build"}\n\`\`\`${o.registry === "crates" && o.repoUrl ? `\n\nTo use it from another Rust project:\n\n\`\`\`sh\ncargo add ${o.name} --git ${o.repoUrl}\n\`\`\`` : ""}`
+    : `\`\`\`sh\n${o.registry === "npm" ? `npm install ${o.name}` : o.registry === "pypi" ? `pip install ${o.name}` : `cargo add ${o.name}`}\n\`\`\``;
+  const npmImport = repoOnly ? "./dist/index.js" : o.name;
   const usage =
     o.registry === "npm"
-      ? `\`\`\`js\nimport { greet } from "${o.name}";\n\nconsole.log(greet("world")); // Hello, world!\n\`\`\``
+      ? `${repoOnly ? "Inside the project folder, after building:\n\n" : ""}\`\`\`js\nimport { greet } from "${npmImport}";\n\nconsole.log(greet("world")); // Hello, world!\n\`\`\``
       : o.registry === "pypi"
         ? `\`\`\`python\nfrom ${mod} import greet\n\nprint(greet("world"))  # Hello, world!\n\`\`\``
         : `\`\`\`rust\nfn main() {\n    println!("{}", ${mod}::greet("world")); // Hello, world!\n}\n\`\`\``;
-  const build =
-    o.registry === "npm" ? "npm install\nnpm run build\nnpm test" : o.registry === "pypi" ? "python -m pip install -e . pytest\npython -m pytest" : "cargo build\ncargo test";
-  const clone = o.repoUrl ? `git clone ${o.repoUrl}.git\ncd ${o.repoUrl.split("/").pop()}\n` : "";
   return `# ${o.name}
 
 ${o.description}
 
 ## Install
 
-\`\`\`sh
 ${install}
-\`\`\`
 
 ## Quick start
 
 ${usage}
 
-## Build from source
+## ${repoOnly ? "Run the tests" : "Build from source"}
 
 \`\`\`sh
-${clone}${build}
+${repoOnly ? "" : clone}${build}
 \`\`\`
 
 ## Troubleshooting
@@ -150,9 +164,12 @@ ${o.license ?? "MIT"}
 function npmFiles(o: ScaffoldOptions, author: { name: string; email?: string }): Record<string, string> {
   const scoped = o.name.startsWith("@");
   const bin = o.name.replace(/^@[^/]+\//, "");
+  const repoOnly = scaffoldTarget(o) === "repo";
   const pkg: Record<string, unknown> = {
     name: o.name,
     version: "0.1.0",
+    // npm refuses to publish a package marked private, so a repo-only project can't be published by accident.
+    ...(repoOnly ? { private: true } : {}),
     description: o.description,
     license: o.license ?? "MIT",
     author: author.email ? `${author.name} <${author.email}>` : author.name,
@@ -167,7 +184,7 @@ function npmFiles(o: ScaffoldOptions, author: { name: string; email?: string }):
     ...(o.repoUrl
       ? { repository: { type: "git", url: `git+${o.repoUrl}.git` }, homepage: `${o.repoUrl}#readme`, bugs: { url: `${o.repoUrl}/issues` } }
       : {}),
-    ...(scoped ? { publishConfig: { access: "public" } } : {}),
+    ...(scoped && !repoOnly ? { publishConfig: { access: "public" } } : {}),
     devDependencies: { "@types/node": "^22.0.0", typescript: "^6.0.3" },
   };
   const files: Record<string, string> = {
@@ -266,7 +283,7 @@ license-files = ["LICENSE"]
 authors = [${authors}]
 requires-python = ">=3.11"
 dependencies = []
-classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
+classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"${scaffoldTarget(o) === "repo" ? ', "Private :: Do Not Upload"' : ""}]
 ${urls}${scripts}
 [tool.hatch.build.targets.wheel]
 packages = ["src/${mod}"]
@@ -339,7 +356,7 @@ description = "${o.description.replace(/"/g, '\\"')}"
 license = "${o.license ?? "MIT"}"
 authors = ["${authorLine}"]
 readme = "README.md"
-${o.repoUrl ? `repository = "${o.repoUrl}"\n` : ""}
+${o.repoUrl ? `repository = "${o.repoUrl}"\n` : ""}${scaffoldTarget(o) === "repo" ? "publish = false\n" : ""}
 [lib]
 name = "${mod}"
 `,
@@ -387,8 +404,8 @@ export async function scaffoldProject(o: ScaffoldOptions): Promise<ScaffoldResul
     ".gitattributes": GITATTRIBUTES,
     ...(o.registry === "npm" ? npmFiles(o, author) : o.registry === "pypi" ? pypiFiles(o, author, mod) : cratesFiles(o, author, mod)),
   };
-  const workflows = o.workflows ?? (o.repoUrl ? "ci+release" : "none");
-  if (workflows !== "none") files[`.github/workflows/${CI_WORKFLOW_FILE}`] = ciWorkflow(o.registry);
+  const workflows = o.workflows ?? (o.repoUrl ? (scaffoldTarget(o) === "both" ? "ci+release" : scaffoldTarget(o) === "repo" ? "ci+repo-release" : "ci") : "none");
+  if (workflows !== "none") files[`.github/workflows/${CI_WORKFLOW_FILE}`] = ciWorkflow(o.registry, { lean: o.private });
   if (workflows === "ci+release") files[`.github/workflows/${RELEASE_WORKFLOW_FILE}`] = releaseWorkflow(o.registry);
   if (workflows === "ci+repo-release") files[`.github/workflows/${RELEASE_WORKFLOW_FILE}`] = repoOnlyReleaseWorkflow();
 

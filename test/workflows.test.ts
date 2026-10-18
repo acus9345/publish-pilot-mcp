@@ -22,6 +22,14 @@ describe("workflows", () => {
     expect(yaml).not.toContain("\t");
   });
 
+  it.each(registries)("%s lean CI runs on Ubuntu only and says why", (registry) => {
+    const yaml = ciWorkflow(registry, { lean: true });
+    expect(yaml).toContain("os: [ubuntu-latest]");
+    expect(yaml).not.toMatch(/windows-latest\]|macos-latest\]/);
+    expect(yaml).toContain("private repos pay for Actions minutes");
+    expect(yaml).not.toContain("\t");
+  });
+
   it("repo-only release just creates a GitHub release", () => {
     const yaml = repoOnlyReleaseWorkflow();
     expect(yaml).toContain("gh release create");

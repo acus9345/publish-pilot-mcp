@@ -93,19 +93,19 @@ After that, every release is a pushed `v*` tag. GitHub Actions publishes with OI
 | `check_names` | Checks that the package and repo names are valid and free, and picks the best free alternative (for npm, `@you/name`). |
 | `login` | Starts a browser login: `gh auth login --web` (returns the one-time code and URL), or `npm login --auth-type=web` in a terminal window. |
 | `job_status` | Polls a running login or publish job: status, output, URLs and codes. |
-| `scaffold_project` | Creates source, tests, README, LICENSE, CHANGELOG, .gitignore, manifest and workflows. Never overwrites files. |
-| `add_workflows` | Writes `ci.yml` and a `release.yml` that uses trusted publishing (OIDC), skips versions that already exist and creates a GitHub release from the CHANGELOG. |
+| `scaffold_project` | Creates source, tests, README, LICENSE, CHANGELOG, .gitignore, manifest and workflows. Never overwrites files. With `target: "repo"` the README explains clone-and-build and the manifest blocks registry publishing. With `private: true`, CI runs on Ubuntu only. |
+| `add_workflows` | Writes `ci.yml` and a `release.yml` that uses trusted publishing (OIDC), skips versions that already exist and creates a GitHub release from the CHANGELOG. `private: true` keeps CI on Ubuntu, because private repos pay for Actions minutes and Windows/macOS cost 2×/10×. |
 | `run_checks` | Install, lint, typecheck, build and test (npm scripts, a Python `.venv` with pytest, or cargo). |
 | `scan_secrets` | Finds `.env` files, private keys and tokens that would be committed. |
 | `inspect_package` | Runs the publish dry run and lists the files that would ship, flagging junk and secrets. |
 | `git_commit` | Runs `git init -b main` if needed and commits. Refuses if secrets would be committed. |
-| `create_github_repo` | Runs `gh repo create <name> --public/--private --source . --push`. |
+| `create_github_repo` | Runs `gh repo create <name> --public/--private --source . --push`, and warns when a private repo's CI would run on paid Windows/macOS minutes. |
 | `publish_package` | Runs `npm publish` (in a terminal window, for npm's 2FA approval), `twine upload` or `cargo publish`. Skips versions that already exist, and waits 24 hours after a rate-limit error. |
 | `setup_trusted_publishing` | Connects the package to `release.yml` (`npm trust github`, or the PyPI/crates.io settings page with the exact values). |
-| `tag_and_release` | Tags `v<version>`, pushes it, and optionally creates the GitHub release from the CHANGELOG. |
+| `tag_and_release` | Tags `v<version>`, pushes it, and creates the GitHub release from the CHANGELOG, unless `release.yml` already does that. |
 | `watch_workflow` | Waits for the workflow run of the current commit (release by default) and returns the failing log if it fails. |
-| `bump_version` | Bumps the patch, minor or major version and adds a CHANGELOG entry. |
-| `verify_install` | Installs from the real registry (or clones the repo) into a new temp folder and runs your quick start. |
+| `bump_version` | Bumps the patch, minor or major version and adds a CHANGELOG entry, or turns the "Unreleased" section into the new version. |
+| `verify_install` | Installs from the real registry (or clones the repo, private ones included) into a new temp folder and runs your README steps one by one, stopping at the first that fails. |
 | `notify` / `open_url` | Desktop notification, and opening a page on github.com, npmjs.com, pypi.org or crates.io. |
 | `run_command` | Runs a command in PowerShell (Windows) or sh. Destructive commands are refused. |
 

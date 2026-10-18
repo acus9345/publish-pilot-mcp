@@ -30,7 +30,7 @@ PHASE 1 — Preflight
 3. check_names(registry, name, repo name). If a name is taken, use the suggested free alternative and record the decision.
 
 PHASE 2 — Build
-4. scaffold_project (never overwrites existing files). Author comes from git config; add repoUrl when publishing a repo.
+4. scaffold_project (never overwrites existing files). Author comes from git config; add repoUrl when publishing a repo. Pass target (repo / package / both) so the README and manifest match, and private: true for a private repo (CI on Ubuntu only, since private repos pay for Actions minutes).
 5. Write the real code and tests. run_checks until everything passes. Fix failures yourself.
 
 PHASE 3 — Quality
@@ -42,7 +42,7 @@ PHASE 3 — Quality
 
 PHASE 4 — Prepare the release
 11. git_commit (it refuses when secrets would be committed).
-12. add_workflows: ci.yml always for repos; release.yml (trusted publishing, skips versions that already exist, GitHub release from CHANGELOG) for "both".
+12. add_workflows if scaffold_project didn't add them: ci.yml always for repos (private: true for private repos); release.yml with release "registry" for "both" (trusted publishing, skips versions that already exist, GitHub release from CHANGELOG), or "github-only" for repo-only.
 13. If GitHub is logged in: create_github_repo. Otherwise leave it for Phase 5.
 
 PHASE 5 — Approvals (skip if nothing applies)
@@ -52,9 +52,9 @@ PHASE 5 — Approvals (skip if nothing applies)
 17. For "both": setup_trusted_publishing(repo owner/name, release.yml). Leave 2FA and Save to the user.
 
 PHASE 6 — Finish
-18. tag_and_release (createRelease only for repo-only projects; for "both" the release workflow creates it).
-19. For "both": watch_workflow until it completes. On failure fix the cause, bump_version patch, git_commit, tag_and_release again. Repeat until green.
-20. verify_install from the real registry (or clone from GitHub) and run the README quick start.
+18. tag_and_release. It creates the GitHub release itself only when release.yml doesn't.
+19. watch_workflow for release.yml on the tag until it completes. On failure fix the cause, bump_version patch, git_commit, tag_and_release again. Repeat until green.
+20. verify_install from the real registry (or clone from GitHub) with the README's steps as a list of commands, so each one must succeed.
 
 RULES
 - Fix your own errors; try at least 3 different fixes before treating something as blocked, then finish everything else.
