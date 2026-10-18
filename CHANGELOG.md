@@ -20,6 +20,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Changed
 
+- `scaffold_project` marks its example `greet()` code, and `inspect_package` reports a problem while that example would still be published, so a hello-world can't ship by accident.
 - New npm projects from `scaffold_project` get a `typecheck` script (`tsc --noEmit`), so `run_checks` runs it instead of skipping it.
 
 ## [0.1.0] - 2026-10-17

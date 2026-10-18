@@ -8,6 +8,7 @@ import { describeJob, run, runShell, startJob, startTerminalJob, waitForJob, typ
 import { checkRepoName, githubLogin } from "./names.js";
 import { authFor, type Registry } from "./preflight.js";
 import { scanFiles, scanProject, type SecretFinding } from "./secrets.js";
+import { EXAMPLE_MARKER } from "./scaffold.js";
 import { RELEASE_WORKFLOW_FILE } from "./workflows.js";
 
 /** Thrown for problems the user (or model) can fix; the message says how. */
@@ -198,8 +199,11 @@ export async function inspectPackage(dir: string): Promise<Record<string, unknow
   }
   if (manifest.kind !== "pypi") sourceFiles = files;
   const junk = [...new Set([...files, ...sourceFiles])].filter((f) => JUNK.test(f.replace(/\\/g, "/")));
-  const secrets: SecretFinding[] = await scanFiles(dir, [...new Set(sourceFiles)].filter((f) => existsSync(join(dir, f))));
+  const shipped = [...new Set(sourceFiles)].filter((f) => existsSync(join(dir, f)));
+  const secrets: SecretFinding[] = await scanFiles(dir, shipped);
+  const examples = await filesContaining(dir, shipped, EXAMPLE_MARKER);
   const problems = [
+    ...examples.map((f) => `${f} still has scaffold_project's example code (greet). Replace it with the real code and remove the "${EXAMPLE_MARKER}" line.`),
     ...junk.map((f) => `Junk file would be published: ${f}. Exclude it ("files" in package.json, .npmignore, or the manifest's include/exclude).`),
     ...secrets.map((s) => `Possible secret (${s.kind}) in ${s.file}${s.line ? `:${s.line}` : ""}. Remove it before publishing.`),
     ...steps.filter((s) => !s.ok).map((s) => `Step failed: ${s.step}. See its output.`),
@@ -213,6 +217,20 @@ export async function inspectPackage(dir: string): Promise<Record<string, unknow
     ...(manifest.kind === "pypi" ? { sdistFiles: sourceFiles } : {}),
     steps,
   };
+}
+
+/** The files among `files` (relative to `dir`) whose text contains `needle`. Large files are skipped. */
+async function filesContaining(dir: string, files: string[], needle: string): Promise<string[]> {
+  const hits: string[] = [];
+  for (const file of files) {
+    try {
+      const info = await stat(join(dir, file));
+      if (info.isFile() && info.size < 1_000_000 && (await readFile(join(dir, file), "utf8")).includes(needle)) hits.push(file);
+    } catch {
+      // unreadable: not ours to judge
+    }
+  }
+  return hits;
 }
 
 /** `git init` (branch main) when needed, refuse if secrets would be committed, then commit everything. */

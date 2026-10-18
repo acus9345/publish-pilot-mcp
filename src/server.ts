@@ -221,7 +221,7 @@ export function createServer(): McpServer {
       const [name, email] = await Promise.all([run("git", ["config", "user.name"]), run("git", ["config", "user.email"])]);
       const author = name.stdout ? `${name.stdout}${email.stdout ? ` <${email.stdout}>` : ""}` : undefined;
       const result = await scaffoldProject({ ...args, dir: abs(args.dir), author });
-      return { ...result, author: author ?? "(git config user.name not set)", next: "Write the real code and tests, then run_checks." };
+      return { ...result, author: author ?? "(git config user.name not set)", next: "Replace the example greet() code, tests, README usage and CLI help with the real code, then run_checks. inspect_package flags the example if it would be published." };
     }),
   );
 

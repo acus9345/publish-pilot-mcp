@@ -1,5 +1,9 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { currentDistFiles, existingRepoAction, extractJson, npmPackageState, parsePackJson, pickRun, prependPath } from "../src/ops.js";
+import { EXAMPLE_MARKER } from "../src/scaffold.js";
+import { tempDir } from "./helpers.js";
+import { currentDistFiles, existingRepoAction, extractJson, inspectPackage, npmPackageState, parsePackJson, pickRun, prependPath } from "../src/ops.js";
 
 const entry = { name: "pkg", size: 10, unpackedSize: 20, files: [{ path: "a]b.js", size: 1 }] };
 
@@ -98,4 +102,18 @@ describe("existingRepoAction", () => {
     expect(existingRepoAction(null, url, null)).toBe("refuse");
     expect(existingRepoAction("https://github.com/ada/other.git", url, true)).toBe("refuse");
   });
+});
+
+describe("inspectPackage", () => {
+  it("flags scaffold example code that would be published", async () => {
+    const dir = await tempDir();
+    await writeFile(join(dir, "package.json"), JSON.stringify({ name: `pp-example-${Date.now()}`, version: "0.1.0", files: ["index.js"] }));
+    await writeFile(join(dir, "index.js"), `// ${EXAMPLE_MARKER}: replace me\nexport const greet = () => "hi";\n`);
+    const flagged = await inspectPackage(dir);
+    expect(flagged.ok).toBe(false);
+    expect((flagged.problems as string[]).join("\n")).toMatch(/index\.js still has scaffold_project's example code/);
+    await writeFile(join(dir, "index.js"), "export const parse = () => [];\n");
+    const clean = await inspectPackage(dir);
+    expect(clean.problems).toEqual([]);
+  }, 60_000);
 });

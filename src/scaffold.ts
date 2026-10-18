@@ -27,6 +27,9 @@ export interface ScaffoldResult {
   skipped: string[];
 }
 
+/** Marks scaffold_project's example code; inspect_package refuses to call a package ready while it ships. */
+export const EXAMPLE_MARKER = "publish-pilot:example-code";
+
 const MIT = `MIT License
 
 Copyright (c) [year] [fullname]
@@ -190,7 +193,9 @@ function npmFiles(o: ScaffoldOptions, author: { name: string; email?: string }):
       null,
       2,
     )}\n`,
-    "src/index.ts": `/**
+    "src/index.ts": `// ${EXAMPLE_MARKER}: replace greet() with the package's real code (and this line) before publishing.
+
+/**
  * Return a friendly greeting.
  * @param name Who to greet. Must be a non-empty string.
  * @example greet("world") // "Hello, world!"
@@ -273,6 +278,8 @@ packages = ["src/${mod}"]
 `,
     [`src/${mod}/__init__.py`]: `"""${o.description}"""
 
+# ${EXAMPLE_MARKER}: replace greet() with the package's real code (and this line) before publishing.
+
 __all__ = ["greet", "__version__"]
 __version__ = "0.1.0"
 
@@ -344,6 +351,8 @@ ${o.repoUrl ? `repository = "${o.repoUrl}"\n` : ""}
 name = "${mod}"
 `,
     "src/lib.rs": `//! ${o.description}
+
+// ${EXAMPLE_MARKER}: replace greet() with the crate's real code (and this line) before publishing.
 
 /// Return a friendly greeting.
 ///
