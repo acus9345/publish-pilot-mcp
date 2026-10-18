@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { addChangelogEntry, bumpSemver, changelogSection, readManifest, writeManifestVersion, type BumpLevel, type ManifestKind } from "./changelog.js";
+import { addChangelogEntry, bumpSemver, changelogSection, promoteUnreleased, readManifest, writeManifestVersion, type BumpLevel, type ManifestKind } from "./changelog.js";
 import { openUrl } from "./desktop.js";
 import { describeJob, run, runShell, startJob, startTerminalJob, waitForJob, type Job, type RunResult } from "./exec.js";
 import { checkRepoName, githubLogin } from "./names.js";
@@ -550,17 +550,27 @@ export async function watchWorkflow(dir: string, workflow = RELEASE_WORKFLOW_FIL
   return result;
 }
 
-/** Bump the manifest version and add a CHANGELOG entry. Does not commit. */
+/**
+ * Bump the manifest version and record it in the CHANGELOG: explicit `notes` become a new
+ * entry; without notes, a non-empty "Unreleased" section becomes the new version. Does not commit.
+ */
 export async function bumpVersion(dir: string, level: BumpLevel, notes: string): Promise<Record<string, unknown>> {
   const manifest = await requireManifest(dir);
   const next = bumpSemver(manifest.version, level);
   const changed = await writeManifestVersion(dir, next);
   const changelogPath = join(dir, "CHANGELOG.md");
   const current = existsSync(changelogPath) ? await readFile(changelogPath, "utf8") : "# Changelog\n";
-  await writeFile(changelogPath, addChangelogEntry(current, next, notes || "### Fixed\n\n- Maintenance release."));
+  const promoted = notes.trim() ? null : promoteUnreleased(current, next);
+  await writeFile(changelogPath, promoted ?? addChangelogEntry(current, next, notes || "### Fixed\n\n- Maintenance release."));
   changed.push("CHANGELOG.md");
   if (manifest.kind === "crates") await run("cargo", ["update", "--workspace"], { cwd: dir, timeoutMs: 120_000 });
-  return { from: manifest.version, to: next, changed, next: "Commit with git_commit, then tag_and_release." };
+  return {
+    from: manifest.version,
+    to: next,
+    changed,
+    changelog: promoted ? "Unreleased notes became this version." : "Added a new entry.",
+    next: "Commit with git_commit, then tag_and_release.",
+  };
 }
 
 /** Install from the real registry (or clone from GitHub) into a fresh temp folder and run a command there. */

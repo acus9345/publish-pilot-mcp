@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { addChangelogEntry, bumpSemver, changelogSection, readManifest, writeManifestVersion } from "../src/changelog.js";
+import { addChangelogEntry, bumpSemver, changelogSection, promoteUnreleased, readManifest, writeManifestVersion } from "../src/changelog.js";
 import { tempDir } from "./helpers.js";
 
 const CHANGELOG = `# Changelog
@@ -49,6 +49,20 @@ describe("changelog", () => {
     expect(updated.indexOf("## [0.2.1] - 2026-02-03")).toBeLessThan(updated.indexOf("## [0.2.0]"));
     expect(updated.indexOf("## [Unreleased]")).toBeLessThan(updated.indexOf("## [0.2.1]"));
     expect(changelogSection(updated, "0.2.1")).toBe("- Fix.");
+  });
+
+  it("promotes a non-empty Unreleased section to the new version", () => {
+    const withNotes = CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n### Fixed\n\n- Windows install.\n");
+    const promoted = promoteUnreleased(withNotes, "0.2.1", "2026-10-18");
+    expect(promoted).toContain("## [0.2.1] - 2026-10-18");
+    expect(promoted).not.toMatch(/Unreleased/);
+    expect(changelogSection(promoted!, "0.2.1")).toBe("### Fixed\n\n- Windows install.");
+    expect(changelogSection(promoted!, "0.2.0")).toBe("### Added\n\n- Feature B.");
+  });
+
+  it("does not promote an empty or missing Unreleased section", () => {
+    expect(promoteUnreleased(CHANGELOG, "0.2.1")).toBeNull();
+    expect(promoteUnreleased("# Changelog\n\n## [0.1.0]\n\n- x\n", "0.1.1")).toBeNull();
   });
 
   it("handles a large changelog", () => {

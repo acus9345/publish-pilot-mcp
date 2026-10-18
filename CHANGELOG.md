@@ -3,11 +3,12 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.1] - 2026-10-18
 
 ### Fixed
 
 - README and `--help`: Windows install now uses `cmd /c npx`, because MCP clients can't start the `npx.cmd` shim directly (`ENOENT`/`EINVAL`). Claude Desktop's config is opened with Settings → Developer → Edit Config, since its location differs between installs.
+- `bump_version` without notes now turns the CHANGELOG's "Unreleased" section into the new version instead of adding a separate "Maintenance release" entry.
 
 ## [0.1.0] - 2026-10-17
 

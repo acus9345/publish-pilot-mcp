@@ -30,6 +30,21 @@ export function changelogSection(changelog: string, version: string): string | n
   return body || null;
 }
 
+/**
+ * Turn a non-empty "## [Unreleased]" section into "## [version] - date".
+ * Returns null when there is no Unreleased section or it has no notes.
+ */
+export function promoteUnreleased(changelog: string, version: string, date = new Date().toISOString().slice(0, 10)): string | null {
+  const lines = changelog.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^##\s+\[?unreleased\]?\s*$/i.test(line));
+  if (start === -1) return null;
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^##\s/.test(line));
+  if (!(end === -1 ? rest : rest.slice(0, end)).join("\n").trim()) return null;
+  lines[start] = `## [${version}] - ${date}`;
+  return lines.join("\n");
+}
+
 /** Insert a new version section at the top of a changelog (below the title/intro). */
 export function addChangelogEntry(changelog: string, version: string, notes: string, date = new Date().toISOString().slice(0, 10)): string {
   const entry = `## [${version}] - ${date}\n\n${notes.trim()}\n`;
