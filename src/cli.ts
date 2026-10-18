@@ -17,9 +17,11 @@ Usage:
 
 Add it to Claude Code:
   claude mcp add publish-pilot -- npx -y publish-pilot-mcp
+  claude mcp add publish-pilot -- cmd /c npx -y publish-pilot-mcp     (native Windows)
 
-Add it to Claude Desktop (claude_desktop_config.json):
+Add it to Claude Desktop (Settings > Developer > Edit Config):
   { "mcpServers": { "publish-pilot": { "command": "npx", "args": ["-y", "publish-pilot-mcp"] } } }
+  Windows: "command": "cmd", "args": ["/c", "npx", "-y", "publish-pilot-mcp"]
 
 Docs: https://github.com/acus9345/publish-pilot-mcp#readme`;
 

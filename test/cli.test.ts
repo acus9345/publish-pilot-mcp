@@ -18,6 +18,7 @@ describe.skipIf(!built)("cli (built)", () => {
     const result = await run(process.execPath, [cliPath, "--help"]);
     expect(result.ok).toBe(true);
     expect(result.stdout).toContain("claude mcp add publish-pilot -- npx -y publish-pilot-mcp");
+    expect(result.stdout).toContain('"command": "cmd", "args": ["/c", "npx", "-y", "publish-pilot-mcp"]');
     expect(result.stdout).toContain("doctor");
   });
 
