@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { childEnv, cleanOutput, describeJob, psQuote, quoteWindowsArg, run, runShell, shQuote, startJob, startTerminalJob, waitForJob, writeToJob } from "../src/exec.js";
+import { childEnv, cleanOutput, decodeOutput, describeJob, powershell51Command, psQuote, quoteWindowsArg, run, runShell, shQuote, startJob, startTerminalJob, waitForJob, writeToJob } from "../src/exec.js";
 import { fake } from "./helpers.js";
 
 const node = process.execPath;
@@ -8,6 +8,18 @@ describe("run", () => {
   it("captures output and exit code", async () => {
     const result = await run(node, ["-e", "console.log('hi'); console.error('warn'); process.exit(3)"]);
     expect(result).toMatchObject({ exitCode: 3, stdout: "hi", stderr: "warn", ok: false, notFound: false });
+  });
+
+  it("keeps stdout and stderr in the order they were written", async () => {
+    const script = "process.stdout.write('one\\n'); setTimeout(() => { process.stderr.write('two\\n'); setTimeout(() => process.stdout.write('three\\n'), 50); }, 50);";
+    const result = await run(node, ["-e", script]);
+    expect(result.output).toBe("one\ntwo\nthree");
+  });
+
+  it("decodes legacy Windows code pages when output is not UTF-8", () => {
+    // "中文" in Big5 (code page 950, Chinese (Hong Kong) Windows), which is invalid UTF-8.
+    expect(decodeOutput(Buffer.from([0xa4, 0xa4, 0xa4, 0xe5]), 950)).toBe("中文");
+    expect(decodeOutput(Buffer.from("✔ ok", "utf8"), 950)).toBe("✔ ok");
   });
 
   it("reports a missing program instead of throwing", async () => {
@@ -112,5 +124,31 @@ describe("jobs", () => {
     const info = describeJob(job);
     expect(info).toMatchObject({ running: false, exitCode: 0 });
     expect(String(info.outputTail)).toContain("got yes");
+  });
+});
+
+describe("powershell51Command", () => {
+  it("rewrites && so Windows PowerShell 5.1 can run it", () => {
+    expect(powershell51Command("npm ci && npm test")).toBe("npm ci; if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }; npm test");
+  });
+
+  it("leaves && inside quotes and lines without && alone", () => {
+    expect(powershell51Command("echo 'a && b'")).toBe("echo 'a && b'");
+    expect(powershell51Command("npm test")).toBe("npm test");
+  });
+
+  it.skipIf(process.platform !== "win32")("stops at the first failing part with its exit code in powershell.exe", async () => {
+    const flags = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"];
+    const ok = await run("powershell.exe", [...flags, powershell51Command("echo one && echo two")]);
+    expect(ok.stdout.split(/\r?\n/)).toEqual(["one", "two"]);
+    const failed = await run("powershell.exe", [...flags, powershell51Command("cmd /c exit 3 && echo never")]);
+    expect(failed.exitCode).toBe(3);
+    expect(failed.stdout).not.toContain("never");
+  });
+
+  it("runShell runs && chains on every platform", async () => {
+    const result = await runShell("echo one && echo two");
+    expect(result.ok).toBe(true);
+    expect(result.stdout.split(/\r?\n/).map((l) => l.trim())).toEqual(["one", "two"]);
   });
 });

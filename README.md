@@ -79,7 +79,7 @@ After that, every release is a pushed `v*` tag. GitHub Actions publishes with OI
 | `inspect_package` | Runs the publish dry run and lists the files that would ship, flagging junk and secrets. |
 | `git_commit` | Runs `git init -b main` if needed and commits. Refuses if secrets would be committed. |
 | `create_github_repo` | Runs `gh repo create <name> --public/--private --source . --push`. |
-| `publish_package` | Runs `npm publish`, `twine upload` or `cargo publish`, opens the approval page, and skips versions that already exist. |
+| `publish_package` | Runs `npm publish`, `twine upload` or `cargo publish` for the current version, opens the approval page, and skips versions that already exist. `dryRun` checks without uploading. |
 | `setup_trusted_publishing` | Connects the package to `release.yml` (`npm trust github`, or the PyPI/crates.io settings page with the exact values). |
 | `tag_and_release` | Tags `v<version>`, pushes it, and optionally creates the GitHub release from the CHANGELOG. |
 | `watch_workflow` | Waits for the release run and returns the failing log if it fails. |
@@ -122,7 +122,8 @@ node dist/cli.js --help
 
 - **`doctor` says a tool is MISSING**: ask Claude to run `install_tool`, or install it yourself (for example `winget install --id GitHub.cli -e`). Then restart your MCP client so it picks up the new PATH.
 - **Claude Desktop on Windows can't start the server**: use `"command": "cmd", "args": ["/c", "npx", "-y", "publish-pilot-mcp"]` and restart Claude Desktop.
-- **`npm publish` fails with E429 `rate limited exceeded`**: npm limits how many packages and versions one account can publish, and it doesn't say what the limit is. Nothing was published. **Don't retry soon: every failed attempt can extend the block.** `publish_package` records the failure in `~/.publish-pilot/rate-limits.json` and refuses to try again for 24 hours (unless called with `force`). Wait, or ask npm to lift it at https://www.npmjs.com/support.
+- **A publish fails with a rate limit** (npm `E429 rate limited exceeded`, or `429 Too Many Requests` from PyPI or crates.io): registries limit how many packages and versions one account can publish, and they don't say what the limit is. Nothing was published. **Don't retry soon: every failed attempt can extend the block.** `publish_package` records the failure in `~/.publish-pilot/rate-limits.json` and refuses to try again for 24 hours (unless called with `force`). Wait, or ask the registry to lift it (for npm, https://www.npmjs.com/support).
+- **`setup_trusted_publishing` says npm is still processing**: a brand-new npm package shows only a `0.0.0-stage` placeholder for a minute or two after the first publish. Wait and call it again.
 - **The npm approval link expired**: ask Claude to call `publish_package` again. Each call opens a fresh link, and versions that are already published are skipped.
 - **The release workflow says the tag doesn't match the version**: the `v*` tag must equal the manifest version. Ask Claude to `bump_version`, commit, and tag the new version. Old tags are never moved.
 - **`npm publish` from Actions fails with 404 or 401**: trusted publishing isn't set up for this repo and `release.yml` yet. Run `setup_trusted_publishing` (the package must already exist on npm).

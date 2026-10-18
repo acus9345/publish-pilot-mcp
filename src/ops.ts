@@ -8,6 +8,7 @@ import { describeJob, run, runShell, startJob, startTerminalJob, waitForJob, typ
 import { checkRepoName, githubLogin } from "./names.js";
 import { authFor, type Registry } from "./preflight.js";
 import { scanFiles, scanProject, type SecretFinding } from "./secrets.js";
+import { EXAMPLE_MARKER } from "./scaffold.js";
 import { RELEASE_WORKFLOW_FILE } from "./workflows.js";
 
 /** Thrown for problems the user (or model) can fix; the message says how. */
@@ -71,7 +72,7 @@ function tail(text: string, chars = 3000): string {
 }
 
 function step(name: string, result: RunResult): StepResult {
-  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  const output = result.output;
   return { step: name, command: result.command, ok: result.ok, output: tail(result.timedOut ? `${output}\n(timed out)` : output) };
 }
 
@@ -89,6 +90,25 @@ async function venvPython(dir: string): Promise<{ python: string; created?: Step
   if (existsSync(python)) return { python };
   const created = await run(process.platform === "win32" ? "python" : "python3", ["-m", "venv", ".venv"], { cwd: dir, timeoutMs: 180_000 });
   return { python, created: step("create virtualenv", created) };
+}
+
+/**
+ * The files in `dist/` built for this name and version. Older builds stay in dist/ after a
+ * version bump, and uploading them again makes twine fail with "File already exists".
+ */
+export function currentDistFiles(files: string[], name: string, version: string): string[] {
+  const v = version.toLowerCase();
+  // Wheels always use the normalised name (my_pkg); sdists from older backends may keep my-pkg.
+  const prefixes = [...new Set([name.replace(/[-_.]+/g, "_").toLowerCase(), name.toLowerCase()])].map((n) => `${n}-${v}`);
+  return files.filter((file) => {
+    const lower = file.toLowerCase();
+    return prefixes.some((p) => (lower.startsWith(`${p}-`) && lower.endsWith(".whl")) || lower === `${p}.tar.gz`);
+  });
+}
+
+async function pypiDist(dir: string, name: string, version: string): Promise<string[]> {
+  const all = existsSync(join(dir, "dist")) ? await readdir(join(dir, "dist")) : [];
+  return currentDistFiles(all, name, version).map((f) => `dist/${f}`);
 }
 
 /** Install, lint, build and test. Stops at the first failing step. */
@@ -139,6 +159,8 @@ const JUNK = /(^|\/)(\.env(\..*)?|.*\.log|\.DS_Store|Thumbs\.db|node_modules\/.*
 export async function inspectPackage(dir: string): Promise<Record<string, unknown>> {
   const manifest = await requireManifest(dir);
   let files: string[] = [];
+  /** Paths, relative to `dir`, of source files that end up in the package, for the secret scan. */
+  let sourceFiles: string[] = [];
   const steps: StepResult[] = [];
   if (manifest.kind === "npm") {
     const pack = await run("npm", ["pack", "--dry-run", "--json"], { cwd: dir, timeoutMs: 300_000 });
@@ -155,11 +177,19 @@ export async function inspectPackage(dir: string): Promise<Record<string, unknow
     if (created) steps.push(created);
     steps.push(step("install build tools", await run(python, ["-m", "pip", "install", "--upgrade", "build", "twine"], { cwd: dir, timeoutMs: 300_000 })));
     steps.push(step("build", await run(python, ["-m", "build"], { cwd: dir, timeoutMs: 300_000 })));
-    const dist = existsSync(join(dir, "dist")) ? (await readdir(join(dir, "dist"))).map((f) => `dist/${f}`) : [];
-    steps.push(step("twine check", await run(python, ["-m", "twine", "check", ...dist], { cwd: dir, timeoutMs: 120_000 })));
+    const dist = await pypiDist(dir, manifest.name, manifest.version);
+    if (dist.length === 0) steps.push({ step: "find dist files", command: "", ok: false, output: `No wheel or sdist for ${manifest.name} ${manifest.version} in dist/.` });
+    else steps.push(step("twine check", await run(python, ["-m", "twine", "check", ...dist], { cwd: dir, timeoutMs: 120_000 })));
     for (const archive of dist.filter((f) => f.endsWith(".whl"))) {
       const list = await run(python, ["-m", "zipfile", "-l", archive], { cwd: dir });
       files.push(...list.stdout.split(/\r?\n/).slice(1).map((l) => l.trim().split(/\s+/)[0] ?? "").filter(Boolean));
+    }
+    // The sdist holds the project's own files under "<name>-<version>/": map them back for the secret scan.
+    for (const archive of dist.filter((f) => f.endsWith(".tar.gz"))) {
+      const list = await run(python, ["-m", "tarfile", "-l", archive], { cwd: dir });
+      const entries = list.stdout.split(/\r?\n/).map((l) => l.trim().replace(/\/$/, "")).filter(Boolean);
+      const inProject = entries.map((e) => e.split("/").slice(1).join("/")).filter(Boolean);
+      sourceFiles.push(...inProject);
     }
   } else {
     const list = await run("cargo", ["package", "--list", "--allow-dirty"], { cwd: dir, timeoutMs: 300_000 });
@@ -167,14 +197,40 @@ export async function inspectPackage(dir: string): Promise<Record<string, unknow
     files = list.stdout.split(/\r?\n/).filter(Boolean);
     steps.push(step("cargo publish --dry-run", await run("cargo", ["publish", "--dry-run", "--allow-dirty"], { cwd: dir, timeoutMs: 600_000 })));
   }
-  const junk = files.filter((f) => JUNK.test(f.replace(/\\/g, "/")));
-  const secrets: SecretFinding[] = manifest.kind === "pypi" ? [] : await scanFiles(dir, files.filter((f) => existsSync(join(dir, f))));
+  if (manifest.kind !== "pypi") sourceFiles = files;
+  const junk = [...new Set([...files, ...sourceFiles])].filter((f) => JUNK.test(f.replace(/\\/g, "/")));
+  const shipped = [...new Set(sourceFiles)].filter((f) => existsSync(join(dir, f)));
+  const secrets: SecretFinding[] = await scanFiles(dir, shipped);
+  const examples = await filesContaining(dir, shipped, EXAMPLE_MARKER);
   const problems = [
+    ...examples.map((f) => `${f} still has scaffold_project's example code (greet). Replace it with the real code and remove the "${EXAMPLE_MARKER}" line.`),
     ...junk.map((f) => `Junk file would be published: ${f}. Exclude it ("files" in package.json, .npmignore, or the manifest's include/exclude).`),
     ...secrets.map((s) => `Possible secret (${s.kind}) in ${s.file}${s.line ? `:${s.line}` : ""}. Remove it before publishing.`),
     ...steps.filter((s) => !s.ok).map((s) => `Step failed: ${s.step}. See its output.`),
   ];
-  return { package: manifest.name, version: manifest.version, ok: problems.length === 0, problems, files, steps };
+  return {
+    package: manifest.name,
+    version: manifest.version,
+    ok: problems.length === 0,
+    problems,
+    files,
+    ...(manifest.kind === "pypi" ? { sdistFiles: sourceFiles } : {}),
+    steps,
+  };
+}
+
+/** The files among `files` (relative to `dir`) whose text contains `needle`. Large files are skipped. */
+async function filesContaining(dir: string, files: string[], needle: string): Promise<string[]> {
+  const hits: string[] = [];
+  for (const file of files) {
+    try {
+      const info = await stat(join(dir, file));
+      if (info.isFile() && info.size < 1_000_000 && (await readFile(join(dir, file), "utf8")).includes(needle)) hits.push(file);
+    } catch {
+      // unreadable: not ours to judge
+    }
+  }
+  return hits;
 }
 
 /** `git init` (branch main) when needed, refuse if secrets would be committed, then commit everything. */
@@ -205,6 +261,17 @@ export async function gitCommit(dir: string, message: string): Promise<Record<st
   return { ok: commit.ok, commit: head.stdout, steps };
 }
 
+/**
+ * What to do when the repo name is already taken on GitHub: push when this folder's origin is that
+ * repo; connect and push when it is empty and the folder has no origin (a create_github_repo that was
+ * interrupted after gh made the repo); otherwise refuse, so an unrelated repo is never touched.
+ */
+export function existingRepoAction(origin: string | null, url: string, isEmpty: boolean | null): "push" | "connect" | "refuse" {
+  const same = (a: string): boolean => a.replace(/\.git$/, "").replace(/\/$/, "").toLowerCase() === url.toLowerCase();
+  if (origin) return same(origin) ? "push" : "refuse";
+  return isEmpty === true ? "connect" : "refuse";
+}
+
 /** Create the GitHub repo from the local folder and push. Refuses to touch an existing repo it didn't create. */
 export async function createGithubRepo(dir: string, name: string, visibility: "public" | "private", description?: string): Promise<Record<string, unknown>> {
   const auth = await authFor("github");
@@ -216,9 +283,19 @@ export async function createGithubRepo(dir: string, name: string, visibility: "p
   const check = await checkRepoName(owner, name);
   const url = `https://github.com/${owner}/${name}`;
   if (check.available === false) {
-    if (remote.ok && remote.stdout.replace(/\.git$/, "").toLowerCase() === url.toLowerCase()) {
+    const view = remote.ok ? null : await run("gh", ["repo", "view", `${owner}/${name}`, "--json", "isEmpty", "--jq", ".isEmpty"], { cwd: dir, timeoutMs: 30_000 });
+    const isEmpty = view?.ok ? view.stdout.trim() === "true" : null;
+    const action = existingRepoAction(remote.ok ? remote.stdout : null, url, isEmpty);
+    const steps: StepResult[] = [];
+    if (action === "connect") {
+      const add = await run("git", ["remote", "add", "origin", `${url}.git`], { cwd: dir });
+      steps.push(step("git remote add origin", add));
+      if (!add.ok) return { ok: false, url, steps };
+    }
+    if (action !== "refuse") {
       const push = await run("git", ["push", "-u", "origin", "HEAD"], { cwd: dir, timeoutMs: 300_000 });
-      return { ok: push.ok, alreadyExisted: true, url, steps: [step("git push", push)] };
+      steps.push(step("git push", push));
+      return { ok: push.ok, alreadyExisted: true, ...(action === "connect" ? { reusedEmptyRepo: true } : {}), url, steps };
     }
     throw new UserError(`${check.reason ?? "That repo name is not available."} Pick another name (for example ${name}-kit) and call create_github_repo again.`);
   }
@@ -245,12 +322,22 @@ export async function versionExists(kind: ManifestKind, name: string, version: s
   }
 }
 
-/** Does any version of this npm package exist? `null` when unknown. */
-async function packageOnRegistry(name: string): Promise<boolean | null> {
+/**
+ * Is this npm package on the registry? `"staging"` while npm is still processing its first
+ * publish (only a `0.0.0-stage` placeholder is listed), `null` when unknown.
+ */
+export function npmPackageState(packument: unknown): boolean | "staging" {
+  const versions = packument && typeof packument === "object" ? (packument as { versions?: Record<string, { stub?: boolean }> }).versions : undefined;
+  const all = Object.entries(versions ?? {});
+  if (all.length === 0) return false;
+  return all.some(([version, info]) => !info?.stub && version !== "0.0.0-stage") ? true : "staging";
+}
+
+async function packageOnRegistry(name: string): Promise<boolean | "staging" | null> {
   try {
     const response = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2F")}`, { signal: AbortSignal.timeout(15_000) });
     if (response.status === 404) return false;
-    return response.ok ? true : null;
+    return response.ok ? npmPackageState(await response.json()) : null;
   } catch {
     return null;
   }
@@ -356,10 +443,18 @@ export async function startLogin(service: "github" | Registry, openBrowser = tru
   };
 }
 
-/** How long to stay away from the registry after an E429. Every failed attempt can extend npm's block. */
+/** How long to stay away from a registry after it rate-limits publishing. Every failed attempt can extend the block. */
 export const RATE_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const RATE_LIMIT_FILE = join(homedir(), ".publish-pilot", "rate-limits.json");
-const RATE_LIMITED = /E429|Too Many Requests|rate limit/i;
+/** npm (E429), twine ("429 Too Many Requests") and cargo ("status 429 Too Many Requests") rate-limit errors. */
+export const RATE_LIMITED = /E429|Too Many Requests|status 429|rate.?limit|published too many/i;
+
+/** Where to ask a registry to lift a rate limit. */
+const RATE_LIMIT_HELP: Record<ManifestKind, string> = {
+  npm: "npm support (https://www.npmjs.com/support)",
+  pypi: "PyPI support (https://pypi.org/help/)",
+  crates: "crates.io support (help@crates.io)",
+};
 
 /** When the registry last rate-limited publishing of `key` (e.g. "npm:my-pkg"), if recorded. */
 export async function lastRateLimit(key: string, file = RATE_LIMIT_FILE): Promise<Date | null> {
@@ -384,7 +479,16 @@ export async function recordRateLimit(key: string, when = new Date(), file = RAT
   await writeFile(file, `${JSON.stringify(data, null, 2)}\n`);
 }
 
-/** Publish the package in `dir`. Skips when the version is already on the registry or a recent E429 says to wait. */
+/** Record a rate limit if `job` (a real publish) ends with one, so the next publish_package waits. */
+export function recordRateLimitOnFailure(job: Job, key: string, file = RATE_LIMIT_FILE): Promise<void> {
+  return waitForJob(job, RATE_LIMIT_COOLDOWN_MS).then(async () => {
+    if (!job.running && job.exitCode !== 0 && RATE_LIMITED.test(job.output)) await recordRateLimit(key, new Date(), file);
+  });
+}
+
+const NEVER_RETRY_429 = "Never retry after a 429 / rate-limit error: each failed attempt can extend the block, and publish_package will wait 24 hours.";
+
+/** Publish the package in `dir`. Skips when the version is already on the registry or a recent rate limit says to wait. */
 export async function publishPackage(dir: string, opts: { dryRun?: boolean; openBrowser?: boolean; force?: boolean; rateLimitFile?: string } = {}): Promise<Record<string, unknown>> {
   const manifest = await requireManifest(dir);
   const exists = await versionExists(manifest.kind, manifest.name, manifest.version);
@@ -400,40 +504,46 @@ export async function publishPackage(dir: string, opts: { dryRun?: boolean; open
       rateLimited: true,
       lastRateLimit: limitedAt.toISOString(),
       retryAfter: retryAfter.toISOString(),
-      reason: `The registry rate-limited publishing ${manifest.name} at ${limitedAt.toISOString()}. Every failed attempt can extend the block, so publish-pilot waits 24 hours before trying again (after ${retryAfter.toISOString()}). Pass force: true only if the block is known to be lifted (for example, npm support confirmed it).`,
+      reason: `The registry rate-limited publishing ${manifest.name} at ${limitedAt.toISOString()}. Every failed attempt can extend the block, so publish-pilot waits 24 hours before trying again (after ${retryAfter.toISOString()}). Pass force: true only if the block is known to be lifted (for example, ${RATE_LIMIT_HELP[manifest.kind]} confirmed it).`,
     };
   }
   const auth = await authFor(manifest.kind);
   if (!auth.loggedIn && !opts.dryRun) throw new UserError(`${auth.detail} Then call publish_package again.`);
   const openBrowser = opts.openBrowser ?? true;
+  const watch = (job: Job): void => {
+    if (!opts.dryRun) void recordRateLimitOnFailure(job, limitKey, opts.rateLimitFile);
+  };
   if (manifest.kind === "npm") {
     const args = ["publish", ...(manifest.name.startsWith("@") ? ["--access", "public"] : []), ...(opts.dryRun ? ["--dry-run"] : [])];
     const label = `npm publish ${manifest.name}@${manifest.version}`;
     const job = opts.dryRun ? startJob("npm", args, { cwd: dir, label }) : npmApprovalJob(args, dir, label, openBrowser);
-    if (!opts.dryRun) {
-      void waitForJob(job, RATE_LIMIT_COOLDOWN_MS).then(() => {
-        if (job.exitCode !== 0 && RATE_LIMITED.test(job.output)) void recordRateLimit(limitKey, new Date(), opts.rateLimitFile);
-      });
-    }
+    watch(job);
     const info = await settle(job, 40);
     return {
       ...info,
       package: manifest.name,
       version: manifest.version,
       forUser: job.running
-        ? `${WINDOW_NOTE} Poll job_status; if it ends with an expired/401 error, call publish_package again for a fresh link. Never retry after E429 (rate limit): each failed attempt can extend the block.`
+        ? `${WINDOW_NOTE} Poll job_status; if it ends with an expired/401 error, call publish_package again for a fresh link. ${NEVER_RETRY_429}`
         : undefined,
+      next: opts.dryRun
+        ? undefined
+        : "npm stages new publishes: after the job succeeds, the version can take a minute or two to appear (a brand-new package first shows a 0.0.0-stage placeholder). Wait for it before setup_trusted_publishing or verify_install.",
     };
   }
   if (manifest.kind === "pypi") {
     const { python } = await venvPython(dir);
-    const dist = existsSync(join(dir, "dist")) ? (await readdir(join(dir, "dist"))).map((f) => `dist/${f}`) : [];
-    if (dist.length === 0) throw new UserError("dist/ is empty. Run run_checks (it builds) or inspect_package first.");
-    const job = startJob(python, ["-m", "twine", "upload", "--non-interactive", ...(opts.dryRun ? ["--repository", "testpypi"] : []), ...dist], { cwd: dir, label: "twine upload" });
-    return { ...(await settle(job, 60)), package: manifest.name, version: manifest.version };
+    const dist = await pypiDist(dir, manifest.name, manifest.version);
+    if (dist.length === 0) throw new UserError(`dist/ has no wheel or sdist for ${manifest.name} ${manifest.version}. Run run_checks (it builds) or inspect_package first.`);
+    // twine has no dry run: `twine check` validates exactly the files that would be uploaded.
+    const args = opts.dryRun ? ["-m", "twine", "check", ...dist] : ["-m", "twine", "upload", "--non-interactive", ...dist];
+    const job = startJob(python, args, { cwd: dir, label: opts.dryRun ? "twine check" : `twine upload ${manifest.name} ${manifest.version}` });
+    watch(job);
+    return { ...(await settle(job, 60)), package: manifest.name, version: manifest.version, files: dist, forUser: opts.dryRun ? undefined : NEVER_RETRY_429 };
   }
-  const job = startJob("cargo", ["publish", ...(opts.dryRun ? ["--dry-run"] : [])], { cwd: dir, label: "cargo publish" });
-  return { ...(await settle(job, 60)), package: manifest.name, version: manifest.version };
+  const job = startJob("cargo", ["publish", ...(opts.dryRun ? ["--dry-run"] : [])], { cwd: dir, label: `cargo publish ${manifest.name} ${manifest.version}` });
+  watch(job);
+  return { ...(await settle(job, 60)), package: manifest.name, version: manifest.version, forUser: opts.dryRun ? undefined : NEVER_RETRY_429 };
 }
 
 /** Connect the package to the GitHub release workflow with trusted publishing (OIDC). */
@@ -450,6 +560,15 @@ export async function setupTrustedPublishing(dir: string, repo: string, workflow
       return {
         ok: false,
         reason: "npm can only add a trusted publisher to a package that already exists. Publish the first version with publish_package, then call this again.",
+        page,
+        values,
+      };
+    }
+    if (packageExists === "staging") {
+      return {
+        ok: false,
+        staging: true,
+        reason: "npm is still processing the first publish (only a 0.0.0-stage placeholder is listed). Wait a minute or two, then call this again.",
         page,
         values,
       };

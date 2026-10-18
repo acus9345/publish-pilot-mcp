@@ -31,7 +31,7 @@ PHASE 1 — Preflight
 
 PHASE 2 — Build
 4. scaffold_project (never overwrites existing files). Author comes from git config; add repoUrl when publishing a repo.
-5. Write the real code and tests. run_checks until everything passes. Fix failures yourself.
+5. Replace the example greet() code, its tests, the README usage and CLI help with the real code (inspect_package flags the example if it would ship). run_checks until everything passes. Fix failures yourself.
 
 PHASE 3 — Quality
 6. Small, obvious API; common case in 1–3 lines; types and docstrings on everything public; helpful errors (what went wrong + how to fix, no raw stack traces); --help/--version for CLIs; minimal dependencies; current runtime versions.

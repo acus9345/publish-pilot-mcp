@@ -1,5 +1,9 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { extractJson, parsePackJson, pickRun, prependPath } from "../src/ops.js";
+import { EXAMPLE_MARKER } from "../src/scaffold.js";
+import { tempDir } from "./helpers.js";
+import { currentDistFiles, existingRepoAction, extractJson, inspectPackage, npmPackageState, parsePackJson, pickRun, prependPath } from "../src/ops.js";
 
 const entry = { name: "pkg", size: 10, unpackedSize: 20, files: [{ path: "a]b.js", size: 1 }] };
 
@@ -49,4 +53,67 @@ describe("prependPath", () => {
     expect(prependPath("/bin2", { Path: "/usr/bin" })).toEqual({ Path: `/bin2${sep}/usr/bin` });
     expect(prependPath("/bin2", {})).toEqual({ PATH: "/bin2" });
   });
+});
+
+describe("currentDistFiles", () => {
+  const files = ["my_pkg-0.1.0-py3-none-any.whl", "my_pkg-0.1.0.tar.gz", "my_pkg-0.2.0-py3-none-any.whl", "my_pkg-0.2.0.tar.gz", "other-0.2.0.tar.gz", ".gitignore"];
+
+  it("keeps only the current version's wheel and sdist", () => {
+    expect(currentDistFiles(files, "my-pkg", "0.2.0")).toEqual(["my_pkg-0.2.0-py3-none-any.whl", "my_pkg-0.2.0.tar.gz"]);
+  });
+
+  it("accepts sdists that keep the dashed name", () => {
+    expect(currentDistFiles(["My-Pkg-1.0.0.tar.gz"], "My-Pkg", "1.0.0")).toEqual(["My-Pkg-1.0.0.tar.gz"]);
+  });
+
+  it("does not match a longer version with the same prefix", () => {
+    expect(currentDistFiles(["my_pkg-0.2.0.post1.tar.gz", "my_pkg-0.2.01-py3-none-any.whl"], "my_pkg", "0.2.0")).toEqual([]);
+  });
+});
+
+describe("npmPackageState", () => {
+  it("treats a package with only the staging placeholder as still processing", () => {
+    expect(npmPackageState({ versions: { "0.0.0-stage": { stub: true } } })).toBe("staging");
+  });
+
+  it("treats a real version as published", () => {
+    expect(npmPackageState({ versions: { "0.0.0-stage": { stub: true }, "0.1.0": {} } })).toBe(true);
+  });
+
+  it("treats no versions as not published", () => {
+    expect(npmPackageState({ versions: {} })).toBe(false);
+    expect(npmPackageState(null)).toBe(false);
+  });
+});
+
+describe("existingRepoAction", () => {
+  const url = "https://github.com/ada/thing";
+
+  it("pushes when origin is already that repo", () => {
+    expect(existingRepoAction("https://github.com/Ada/thing.git", url, null)).toBe("push");
+  });
+
+  it("connects an empty repo when the folder has no origin (an interrupted create)", () => {
+    expect(existingRepoAction(null, url, true)).toBe("connect");
+  });
+
+  it("refuses a repo with history, an unknown state, or a different origin", () => {
+    expect(existingRepoAction(null, url, false)).toBe("refuse");
+    expect(existingRepoAction(null, url, null)).toBe("refuse");
+    expect(existingRepoAction("https://github.com/ada/other.git", url, true)).toBe("refuse");
+  });
+});
+
+describe("inspectPackage", () => {
+  it("flags scaffold example code that would be published", async () => {
+    const dir = await tempDir();
+    await writeFile(join(dir, "package.json"), JSON.stringify({ name: `pp-example-${Date.now()}`, version: "0.1.0", files: ["index.js"] }));
+    await writeFile(join(dir, "index.js"), `// ${EXAMPLE_MARKER}: replace me\nexport const greet = () => "hi";\n`);
+    const flagged = await inspectPackage(dir);
+    expect(flagged.ok).toBe(false);
+    expect((flagged.problems as string[]).join("\n")).toMatch(/index\.js still has scaffold_project's example code/);
+    await writeFile(join(dir, "index.js"), "export const parse = () => [];\n");
+    const clean = await inspectPackage(dir);
+    expect(clean.problems).toEqual([]);
+  }, 60_000);
 });

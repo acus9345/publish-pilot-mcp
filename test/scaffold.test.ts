@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { licenseText, moduleName, scaffoldProject } from "../src/scaffold.js";
+import { EXAMPLE_MARKER, licenseText, moduleName, scaffoldProject } from "../src/scaffold.js";
 import { tempDir } from "./helpers.js";
 
 const base = { description: "Does a thing.", license: "MIT", author: "Ada Lovelace <ada@example.com>" };
@@ -22,6 +22,7 @@ describe("scaffoldProject", () => {
       author: "Ada Lovelace <ada@example.com>",
       publishConfig: { access: "public" },
       bin: { thing: "dist/cli.js" },
+      scripts: { typecheck: "tsc --noEmit" },
       repository: { url: "git+https://github.com/ada/thing.git" },
     });
     const license = await readFile(join(dir, "LICENSE"), "utf8");
@@ -54,6 +55,16 @@ describe("scaffoldProject", () => {
     expect(cargo).toContain('name = "my-thing"');
     expect(cargo).toContain('repository = "https://github.com/ada/my-thing"');
     expect(await readFile(join(dir, "src/lib.rs"), "utf8")).toContain("my_thing::greet");
+  });
+
+  it.each([
+    ["npm", "src/index.ts"],
+    ["pypi", "src/my_thing/__init__.py"],
+    ["crates", "src/lib.rs"],
+  ] as const)("marks the %s example code so inspect_package can catch it", async (registry, file) => {
+    const dir = await tempDir();
+    await scaffoldProject({ ...base, dir, name: "my-thing", registry });
+    expect(await readFile(join(dir, file), "utf8")).toContain(EXAMPLE_MARKER);
   });
 
   it("escapes quotes in descriptions", async () => {

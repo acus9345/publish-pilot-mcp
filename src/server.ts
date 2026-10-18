@@ -8,6 +8,7 @@ import { describeJob, getJob, listJobs, run, runShell, stopJob, waitForJob, writ
 import { checkCommand } from "./guard.js";
 import { checkRepoName, findFreeName, githubLogin } from "./names.js";
 import {
+  RATE_LIMITED,
   UserError,
   bumpVersion,
   createGithubRepo,
@@ -30,12 +31,17 @@ import { VERSION } from "./version.js";
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
-/** Wrap a handler: JSON output, and friendly errors instead of stack traces. */
+/**
+ * Wrap a handler: JSON output, and friendly errors instead of stack traces. A result with
+ * `ok: false` (a failed check, push or verify) is flagged as an error so clients and the
+ * model don't read it as a success.
+ */
 function handler<A>(fn: (args: A) => Promise<unknown>): (args: A) => Promise<ToolResult> {
   return async (args: A) => {
     try {
       const value = await fn(args);
-      return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
+      const failed = Boolean(value) && typeof value === "object" && (value as { ok?: unknown }).ok === false;
+      return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }], ...(failed ? { isError: true } : {}) };
     } catch (error) {
       const message = error instanceof UserError || error instanceof TypeError || error instanceof Error ? error.message : String(error);
       return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
@@ -52,8 +58,8 @@ const abs = (dir: string): string => resolve(dir);
 /** Explain common ways a login or publish job ends badly, and what to do next. */
 export function jobHint(running: boolean, exitCode: number | null, output: string): string | undefined {
   if (running || exitCode === 0) return undefined;
-  if (/E429|Too Many Requests|rate limit/i.test(output)) {
-    return "The registry rate-limited publishing (npm caps how many packages and versions an account can publish, and does not say the limit). Nothing was published. Do NOT retry soon: each failed attempt can extend the block. publish_package now refuses for 24 hours; tell the user, and wait, or ask npm support (https://www.npmjs.com/support) to lift it.";
+  if (RATE_LIMITED.test(output)) {
+    return "The registry rate-limited publishing (npm, PyPI and crates.io cap how many packages and versions an account can publish in a short time, and do not say the limit). Nothing was published. Do NOT retry soon: each failed attempt can extend the block. publish_package now refuses for 24 hours; tell the user, and wait, or ask the registry's support to lift it.";
   }
   if (/E403.*(previously published|cannot publish over)/i.test(output)) return "This version already exists. Run bump_version, commit, and publish the new version.";
   if (/E403|E404/.test(output) && /similar to existing|too similar/i.test(output)) return "npm rejected the name as too similar to an existing package. Use check_names to pick another name (a scoped @you/name always works).";
@@ -215,7 +221,7 @@ export function createServer(): McpServer {
       const [name, email] = await Promise.all([run("git", ["config", "user.name"]), run("git", ["config", "user.email"])]);
       const author = name.stdout ? `${name.stdout}${email.stdout ? ` <${email.stdout}>` : ""}` : undefined;
       const result = await scaffoldProject({ ...args, dir: abs(args.dir), author });
-      return { ...result, author: author ?? "(git config user.name not set)", next: "Write the real code and tests, then run_checks." };
+      return { ...result, author: author ?? "(git config user.name not set)", next: "Replace the example greet() code, tests, README usage and CLI help with the real code, then run_checks. inspect_package flags the example if it would be published." };
     }),
   );
 
@@ -310,7 +316,7 @@ export function createServer(): McpServer {
     "create_github_repo",
     {
       title: "Create the GitHub repo and push",
-      description: "gh repo create <name> --public|--private --source=. --push. Needs a commit and a GitHub login. If the repo already exists and is this folder's origin, just pushes.",
+      description: "gh repo create <name> --public|--private --source=. --push. Needs a commit and a GitHub login. If the repo already exists and is this folder's origin, just pushes; if it exists, is empty and the folder has no origin (an earlier create was interrupted), connects and pushes.",
       inputSchema: {
         dir: dirArg,
         name: z.string().describe("Repo name (without owner)."),
@@ -327,12 +333,12 @@ export function createServer(): McpServer {
     {
       title: "Publish the package",
       description:
-        "Publish from the terminal (npm publish [--access public], twine upload, cargo publish). Skips when the version already exists, and for 24 hours after the registry answered E429 (retries can extend a rate-limit block). Returns a job; npm approval runs in a real terminal. If an approval link expires, call again.",
+        "Publish from the terminal (npm publish [--access public], twine upload, cargo publish). Uploads only the current version's files. Skips when the version already exists, and for 24 hours after the registry rate-limited publishing (429; retries can extend the block). Returns a job; npm approval runs in a real terminal. If an approval link expires, call again.",
       inputSchema: {
         dir: dirArg,
-        dryRun: z.boolean().default(false),
+        dryRun: z.boolean().default(false).describe("Check without uploading: npm publish --dry-run, twine check, cargo publish --dry-run."),
         openBrowser: z.boolean().default(true).describe("Open approval pages in the default browser."),
-        force: z.boolean().default(false).describe("Publish even within 24 hours of an E429. Only when the user confirms the block was lifted."),
+        force: z.boolean().default(false).describe("Publish even within 24 hours of a rate limit (429). Only when the user confirms the block was lifted."),
       },
       annotations: { destructiveHint: false, openWorldHint: true },
     },
