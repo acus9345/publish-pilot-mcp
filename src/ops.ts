@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { clearCache } from "./cache.js";
 import { addChangelogEntry, bumpSemver, changelogSection, promoteUnreleased, readManifest, writeManifestVersion, type BumpLevel, type ManifestKind } from "./changelog.js";
 import { openUrl } from "./desktop.js";
 import { describeJob, run, runShell, startJob, startTerminalJob, waitForJob, type Job, type RunResult } from "./exec.js";
@@ -207,12 +208,10 @@ export async function gitCommit(dir: string, message: string): Promise<Record<st
 
 /** Create the GitHub repo from the local folder and push. Refuses to touch an existing repo it didn't create. */
 export async function createGithubRepo(dir: string, name: string, visibility: "public" | "private", description?: string): Promise<Record<string, unknown>> {
-  const auth = await authFor("github");
-  if (!auth.loggedIn) throw new UserError(`${auth.detail} The repo can be created once you are logged in.`);
-  const owner = await githubLogin();
-  if (!owner) throw new UserError("Could not read your GitHub username from gh. Run `gh auth status` to check the login.");
   if (!existsSync(join(dir, ".git"))) throw new UserError("This folder is not a git repo yet. Run git_commit first.");
-  const remote = await run("git", ["remote", "get-url", "origin"], { cwd: dir });
+  const [auth, owner, remote] = await Promise.all([authFor("github"), githubLogin(), run("git", ["remote", "get-url", "origin"], { cwd: dir })]);
+  if (!auth.loggedIn) throw new UserError(`${auth.detail} The repo can be created once you are logged in.`);
+  if (!owner) throw new UserError("Could not read your GitHub username from gh. Run `gh auth status` to check the login.");
   const check = await checkRepoName(owner, name);
   const url = `https://github.com/${owner}/${name}`;
   if (check.available === false) {
@@ -249,7 +248,7 @@ export async function versionExists(kind: ManifestKind, name: string, version: s
         ? `https://pypi.org/pypi/${name}/${version}/json`
         : `https://crates.io/api/v1/crates/${name}/${version}`;
   try {
-    const response = await fetch(url, { headers: { "User-Agent": "publish-pilot-mcp" }, signal: AbortSignal.timeout(15_000) });
+    const response = await fetch(url, { method: "HEAD", headers: { "User-Agent": "publish-pilot-mcp" }, signal: AbortSignal.timeout(15_000) });
     if (response.status === 404) return false;
     return response.ok ? true : null;
   } catch {
@@ -260,7 +259,7 @@ export async function versionExists(kind: ManifestKind, name: string, version: s
 /** Does any version of this npm package exist? `null` when unknown. */
 async function packageOnRegistry(name: string): Promise<boolean | null> {
   try {
-    const response = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2F")}`, { signal: AbortSignal.timeout(15_000) });
+    const response = await fetch(`https://registry.npmjs.org/${name.replace("/", "%2F")}`, { method: "HEAD", signal: AbortSignal.timeout(15_000) });
     if (response.status === 404) return false;
     return response.ok ? true : null;
   } catch {
@@ -329,6 +328,8 @@ async function settle(job: Job, seconds = 25): Promise<Record<string, unknown>> 
 
 /** Start a browser login for a service. Returns a job to poll with job_status. */
 export async function startLogin(service: "github" | Registry, openBrowser = true): Promise<Record<string, unknown>> {
+  // Check for real: a remembered login may have expired, which is often why login was called.
+  clearCache("auth:");
   const auth = await authFor(service);
   if (auth.loggedIn) return { alreadyLoggedIn: true, ...auth };
   if (service === "github") {
@@ -509,8 +510,8 @@ export async function tagAndRelease(dir: string, opts: { version?: string; creat
   if (status.stdout) throw new UserError("There are uncommitted changes. Commit them with git_commit before tagging.");
   const existing = await run("git", ["rev-parse", "-q", "--verify", `refs/tags/${tag}`], { cwd: dir });
   if (!existing.ok) steps.push(step("git tag", await run("git", ["tag", "-a", tag, "-m", tag], { cwd: dir })));
-  steps.push(step("push branch", await run("git", ["push", "origin", "HEAD"], { cwd: dir, timeoutMs: 300_000 })));
-  steps.push(step("push tag", await run("git", ["push", "origin", tag], { cwd: dir, timeoutMs: 300_000 })));
+  // One atomic push: a single connection, and the tag (which starts the release) never lands without its commit.
+  steps.push(step("push branch and tag", await run("git", ["push", "--atomic", "origin", "HEAD", `refs/tags/${tag}`], { cwd: dir, timeoutMs: 300_000 })));
   const workflowReleases = await releaseWorkflowCreatesRelease(dir);
   const createRelease = opts.createRelease ?? !workflowReleases;
   if (!createRelease) {
@@ -547,6 +548,9 @@ interface RunInfo {
   event: string;
 }
 
+/** How often watch_workflow re-checks a running workflow. */
+const WATCH_POLL_MS = 5_000;
+
 /** Pick the run to report: for `ref` (branch or tag) if given, and for commit `sha` if given. */
 export function pickRun(runs: RunInfo[], ref?: string, sha?: string): RunInfo | undefined {
   return runs.find((r) => (!ref || r.headBranch === ref) && (!sha || r.headSha === sha));
@@ -568,7 +572,7 @@ export async function watchWorkflow(dir: string, workflow = RELEASE_WORKFLOW_FIL
     if (!list.ok) throw new UserError(`Could not list workflow runs: ${list.stderr || list.stdout}. Check that the repo exists on GitHub and gh is logged in.`);
     latest = pickRun(JSON.parse(list.stdout || "[]") as RunInfo[], ref, sha);
     if (latest?.status === "completed" || Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(10_000, Math.max(0, deadline - Date.now()))));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(WATCH_POLL_MS, Math.max(0, deadline - Date.now()))));
   }
   if (!latest) {
     return { found: false, commit: sha, hint: `No run of ${workflow} for commit ${sha?.slice(0, 7) ?? "HEAD"}${ref ? ` on ${ref}` : ""} yet. Runs can take a few seconds to appear after a push; call again. If it never appears, check the workflow's 'on:' triggers.` };

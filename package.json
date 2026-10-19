@@ -1,6 +1,6 @@
 {
   "name": "publish-pilot-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server that lets Claude take a project from nothing to a published GitHub repo and npm/PyPI/crates.io package: preflight, login, scaffold, checks, publish, release.",
   "license": "MIT",
   "author": "acus9345 <acus9345@gmail.com>",

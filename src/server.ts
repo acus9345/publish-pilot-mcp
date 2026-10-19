@@ -8,7 +8,7 @@ import { z } from "zod";
 import { notify, openUrl } from "./desktop.js";
 import { describeJob, getJob, listJobs, run, runShell, stopJob, waitForJob, writeToJob } from "./exec.js";
 import { checkCommand } from "./guard.js";
-import { checkRepoName, findFreeName, githubLogin } from "./names.js";
+import { checkOwnRepoNames, checkRepoName, findFreeName, firstFree, githubLogin } from "./names.js";
 import {
   UserError,
   bumpVersion,
@@ -24,7 +24,7 @@ import {
   watchWorkflow,
 } from "./ops.js";
 import { playbook } from "./playbook.js";
-import { checkTool, installCommand, preflight, TOOL_CATALOG } from "./preflight.js";
+import { checkTool, installCommand, npmAuth, preflight, TOOL_CATALOG } from "./preflight.js";
 import { scaffoldProject } from "./scaffold.js";
 import { scanProject } from "./secrets.js";
 import { CI_WORKFLOW_FILE, RELEASE_WORKFLOW_FILE, ciWorkflow, releaseWorkflow, repoOnlyReleaseWorkflow } from "./workflows.js";
@@ -58,7 +58,7 @@ function handler<A>(fn: (args: A) => Promise<unknown>): (args: A, extra?: Extra)
         : undefined;
     try {
       const value = await fn(args);
-      return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
+      return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }] };
     } catch (error) {
       const message = error instanceof UserError || error instanceof TypeError || error instanceof Error ? error.message : String(error);
       return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
@@ -145,31 +145,33 @@ export function createServer(): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     handler(async ({ registry, packageName, repoName }) => {
-      const owner = await githubLogin();
-      const out: Record<string, unknown> = { githubUser: owner };
-      if (packageName) {
-        if (!registry) throw new UserError("Pass 'registry' together with 'packageName'.");
-        const npmUser = registry === "npm" ? (await run("npm", ["whoami"], { timeoutMs: 20_000 })).stdout.trim() || owner : owner;
-        const { chosen, checks } = await findFreeName(registry, packageName, npmUser ?? undefined);
-        out.package = { requested: packageName, chosen, checks };
-      }
-      if (repoName) {
-        if (!owner) out.repo = { requested: repoName, available: null, reason: "Log in to GitHub (login tool) to check repo names." };
-        else {
-          const candidates = [repoName, `${repoName}-kit`, `${repoName}-tool`, `${repoName}-lib`];
-          const checks = [];
-          let chosen: string | null = null;
-          for (const name of candidates) {
-            const check = await checkRepoName(owner, name);
-            checks.push(check);
-            if (check.valid && check.available) {
-              chosen = name;
-              break;
-            }
-          }
-          out.repo = { owner, requested: repoName, chosen, url: chosen ? `https://github.com/${owner}/${chosen}` : null, checks };
-        }
-      }
+      if (packageName && !registry) throw new UserError("Pass 'registry' together with 'packageName'.");
+      // Everything runs at once. One GraphQL call answers both the login and every repo name.
+      const repoCandidates = repoName ? [repoName, `${repoName}-kit`, `${repoName}-tool`, `${repoName}-lib`] : [];
+      const repos = repoName ? checkOwnRepoNames(repoCandidates) : Promise.resolve(null);
+      const ownerPromise = repos.then((r) => r?.owner ?? githubLogin());
+      const npmUser = packageName && registry === "npm" ? npmAuth().then((a) => a.account) : undefined;
+      const checkRepo = async (): Promise<unknown> => {
+        if (!repoName) return undefined;
+        const fast = await repos;
+        const owner = await ownerPromise;
+        if (!owner) return { requested: repoName, available: null, reason: "Log in to GitHub (login tool) to check repo names." };
+        const freeAt = fast?.checks.findIndex((c) => c.valid && c.available === true) ?? -1;
+        const { chosen, checks } = fast
+          ? { chosen: freeAt === -1 ? null : repoCandidates[freeAt]!, checks: freeAt === -1 ? fast.checks : fast.checks.slice(0, freeAt + 1) }
+          : await firstFree(repoName, repoCandidates.slice(1), (name) => checkRepoName(owner, name));
+        return { owner, requested: repoName, chosen, url: chosen ? `https://github.com/${owner}/${chosen}` : null, checks };
+      };
+      const checkPackage = async (): Promise<unknown> => {
+        if (!packageName || !registry) return undefined;
+        const user = Promise.all([npmUser, ownerPromise]).then(([u, o]) => u ?? o ?? undefined);
+        const { chosen, checks } = await findFreeName(registry, packageName, user);
+        return { requested: packageName, chosen, checks };
+      };
+      const [githubUser, pkg, repo] = await Promise.all([ownerPromise, checkPackage(), checkRepo()]);
+      const out: Record<string, unknown> = { githubUser };
+      if (pkg) out.package = pkg;
+      if (repo) out.repo = repo;
       return out;
     }),
   );

@@ -3,6 +3,17 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-10-19
+
+### Changed
+
+- Faster. `preflight` checks tools, logins and the git identity all at once, and remembers found tools (10 minutes) and logged-in accounts (5 minutes), so later calls take about 30 ms instead of about 1.1 s. A missing tool or a logged-out account is checked again on every call, and `login` always checks for real.
+- `check_names` takes about 1 s instead of about 3.5 s. One GitHub GraphQL request returns your login and checks every repo name, the package and repo checks run at the same time, and alternatives are checked in parallel only when the requested name is taken.
+- Registry lookups use `HEAD` requests, so checking a popular name like `react` no longer downloads its 7 MB package record.
+- `tag_and_release` pushes the branch and the tag in one atomic push, so the tag never arrives without its commit.
+- `watch_workflow` checks a running workflow every 5 seconds instead of 10.
+- Tool results are compact JSON, which is about 30% fewer tokens for the model to read.
+
 ## [0.2.0] - 2026-10-18
 
 Found by using publish-pilot to create a private repo end to end.

@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { cached } from "./cache.js";
 import { run } from "./exec.js";
 
 export type Registry = "npm" | "pypi" | "crates";
@@ -49,8 +50,16 @@ function pythonCommand(): string {
   return process.platform === "win32" ? "python" : "python3";
 }
 
-/** Check one tool. Never throws. */
-export async function checkTool(name: string): Promise<ToolInfo> {
+/** How long a found tool or a logged-in account is trusted before it is checked again. */
+export const TOOL_TTL_MS = 10 * 60_000;
+export const AUTH_TTL_MS = 5 * 60_000;
+
+/** Check one tool. Never throws. Installed tools are remembered for a while; missing ones are checked every time. */
+export function checkTool(name: string): Promise<ToolInfo> {
+  return cached(`tool:${name}`, TOOL_TTL_MS, () => probeTool(name), (t) => t.installed);
+}
+
+async function probeTool(name: string): Promise<ToolInfo> {
   const entry = TOOL_CATALOG[name];
   const cmd = name === "python" ? pythonCommand() : name;
   const result = await run(cmd, entry?.versionArgs ?? ["--version"], { timeoutMs: 20_000 });
@@ -66,8 +75,12 @@ export async function checkTool(name: string): Promise<ToolInfo> {
   };
 }
 
-/** Is the GitHub CLI logged in? */
-export async function githubAuth(): Promise<AuthInfo> {
+/** Is the GitHub CLI logged in? A logged-in result is remembered for a few minutes. */
+export function githubAuth(): Promise<AuthInfo> {
+  return cached("auth:github", AUTH_TTL_MS, probeGithubAuth, (a) => a.loggedIn);
+}
+
+async function probeGithubAuth(): Promise<AuthInfo> {
   const result = await run("gh", ["auth", "status", "--hostname", "github.com"], { timeoutMs: 20_000 });
   if (result.notFound) return { service: "github", loggedIn: false, detail: "GitHub CLI (gh) is not installed. Run install_tool with name 'gh'." };
   const text = `${result.stdout}\n${result.stderr}`;
@@ -77,8 +90,12 @@ export async function githubAuth(): Promise<AuthInfo> {
     : { service: "github", loggedIn: false, detail: "Not logged in to GitHub. Run the login tool with service 'github'." };
 }
 
-/** Is npm logged in to the public registry? */
-export async function npmAuth(): Promise<AuthInfo> {
+/** Is npm logged in to the public registry? A logged-in result is remembered for a few minutes. */
+export function npmAuth(): Promise<AuthInfo> {
+  return cached("auth:npm", AUTH_TTL_MS, probeNpmAuth, (a) => a.loggedIn);
+}
+
+async function probeNpmAuth(): Promise<AuthInfo> {
   const result = await run("npm", ["whoami", "--registry", "https://registry.npmjs.org/"], { timeoutMs: 30_000 });
   if (result.notFound) return { service: "npm", loggedIn: false, detail: "npm is not installed. Run install_tool with name 'node'." };
   const account = result.stdout.split(/\r?\n/).pop()?.trim();
@@ -132,21 +149,20 @@ export interface PreflightReport {
   nextSteps: string[];
 }
 
-/** Check tools, logins and git identity for a target. Starts no logins. */
+/** Check tools, logins and git identity for a target, all at once. Starts no logins. */
 export async function preflight(target: Target, registry?: Registry): Promise<PreflightReport> {
-  const toolNames = requiredTools(target, registry);
-  const tools = await Promise.all(toolNames.map(checkTool));
-  const missingTools = tools.filter((t) => !t.installed).map((t) => t.name);
-
   const services: AuthInfo["service"][] = [];
-  if (target !== "package" && !missingTools.includes("gh")) services.push("github");
-  if (target !== "repo" && registry && !missingTools.some((t) => t !== "git")) services.push(registry);
-  const auth = await Promise.all(services.map(authFor));
-
-  const [name, email] = await Promise.all([
+  if (target !== "package") services.push("github");
+  if (target !== "repo" && registry) services.push(registry);
+  const [tools, allAuth, name, email] = await Promise.all([
+    Promise.all(requiredTools(target, registry).map(checkTool)),
+    Promise.all(services.map(authFor)),
     run("git", ["config", "user.name"], { timeoutMs: 10_000 }),
     run("git", ["config", "user.email"], { timeoutMs: 10_000 }),
   ]);
+  const missingTools = tools.filter((t) => !t.installed).map((t) => t.name);
+  // A login can't be checked without its CLI; the missing tool is reported instead.
+  const auth = allAuth.filter((a) => (a.service === "github" ? !missingTools.includes("gh") : !missingTools.some((t) => t !== "git")));
   const gitIdentity = { name: name.stdout || undefined, email: email.stdout || undefined };
 
   const nextSteps: string[] = [];

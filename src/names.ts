@@ -1,5 +1,6 @@
+import { cached } from "./cache.js";
 import { run } from "./exec.js";
-import type { Registry } from "./preflight.js";
+import { AUTH_TTL_MS, type Registry } from "./preflight.js";
 
 export interface NameCheck {
   name: string;
@@ -46,10 +47,11 @@ function registryUrl(registry: Registry, name: string): string {
   }
 }
 
-async function urlExists(url: string): Promise<boolean | null> {
+/** Does the URL exist? HEAD only: a popular npm package's full record is several MB. */
+export async function urlExists(url: string): Promise<boolean | null> {
   try {
     const response = await fetch(url, {
-      method: "GET",
+      method: "HEAD",
       headers: { "User-Agent": "publish-pilot-mcp (https://github.com/acus9345/publish-pilot-mcp)", Accept: "application/json" },
       signal: AbortSignal.timeout(15_000),
     });
@@ -70,10 +72,17 @@ export async function checkPackageName(registry: Registry, name: string): Promis
   return { name, valid: true, available: !exists, reason: exists ? "Already taken on the registry." : undefined };
 }
 
-/** The GitHub login of the authenticated gh user, if any. */
-export async function githubLogin(): Promise<string | null> {
-  const result = await run("gh", ["api", "user", "--jq", ".login"], { timeoutMs: 20_000 });
-  return result.ok && result.stdout ? result.stdout.trim() : null;
+/** The GitHub login of the authenticated gh user, if any. Remembered for a few minutes once known. */
+export function githubLogin(): Promise<string | null> {
+  return cached(
+    "auth:github-login",
+    AUTH_TTL_MS,
+    async () => {
+      const result = await run("gh", ["api", "user", "--jq", ".login"], { timeoutMs: 20_000 });
+      return result.ok && result.stdout ? result.stdout.trim() : null;
+    },
+    (login) => login !== null,
+  );
 }
 
 /** Check whether `owner/name` is free on GitHub (requires gh to be logged in for private repos). */
@@ -97,13 +106,54 @@ export function nameAlternatives(registry: Registry, name: string, user?: string
   return [...new Set(out)].filter((n) => n !== name);
 }
 
-/** Return the first free name among `name` and its alternatives. */
-export async function findFreeName(registry: Registry, name: string, user?: string): Promise<{ chosen: string | null; checks: NameCheck[] }> {
-  const checks: NameCheck[] = [];
-  for (const candidate of [name, ...nameAlternatives(registry, name, user)]) {
-    const check = await checkPackageName(registry, candidate);
-    checks.push(check);
-    if (check.valid && check.available) return { chosen: candidate, checks };
+/**
+ * Return the first free name among `first` and then `rest`, in order. `first` is checked alone
+ * (it is usually free) while `rest` may still be loading; when it is taken, the rest are checked
+ * at the same time.
+ */
+export async function firstFree(
+  first: string,
+  rest: string[] | Promise<string[]>,
+  check: (name: string) => Promise<NameCheck>,
+): Promise<{ chosen: string | null; checks: NameCheck[] }> {
+  const firstCheck = await check(first);
+  const free = (c: NameCheck): boolean => c.valid && c.available === true;
+  if (free(firstCheck)) return { chosen: first, checks: [firstCheck] };
+  const names = await rest;
+  const others = await Promise.all(names.map(check));
+  const index = others.findIndex(free);
+  return index === -1 ? { chosen: null, checks: [firstCheck, ...others] } : { chosen: names[index]!, checks: [firstCheck, ...others.slice(0, index + 1)] };
+}
+
+/** Return the first free name among `name` and its alternatives. `user` (for scoped names) may still be loading. */
+export function findFreeName(registry: Registry, name: string, user?: string | Promise<string | undefined>): Promise<{ chosen: string | null; checks: NameCheck[] }> {
+  return firstFree(name, Promise.resolve(user).then((u) => nameAlternatives(registry, name, u)), (candidate) => checkPackageName(registry, candidate));
+}
+
+/**
+ * Your GitHub login and whether each repo name is free under it, in one GraphQL request.
+ * `null` when gh can't answer (not installed, logged out, offline).
+ */
+export async function checkOwnRepoNames(names: string[]): Promise<{ owner: string; checks: NameCheck[] } | null> {
+  const valid = names.filter((n) => GITHUB_RE.test(n));
+  const fields = valid.map((n, i) => `r${i}: repository(name: ${JSON.stringify(n)}) { id }`).join(" ");
+  const result = await run("gh", ["api", "graphql", "-f", `query=query { viewer { login ${fields} } }`], { timeoutMs: 20_000 });
+  let viewer: Record<string, unknown> | undefined;
+  let errors: { type?: string; path?: string[] }[] = [];
+  try {
+    const body = JSON.parse(result.stdout) as { data?: { viewer?: Record<string, unknown> }; errors?: typeof errors };
+    viewer = body.data?.viewer;
+    errors = body.errors ?? [];
+  } catch {
+    return null;
   }
-  return { chosen: null, checks };
+  const owner = typeof viewer?.login === "string" ? viewer.login : null;
+  // Unknown names come back as NOT_FOUND errors; any other error means the answer can't be trusted.
+  if (!viewer || !owner || errors.some((e) => e.type !== "NOT_FOUND")) return null;
+  const checks = names.map((name): NameCheck => {
+    const i = valid.indexOf(name);
+    if (i === -1) return { name, valid: false, available: false, reason: "GitHub repo names may only contain letters, digits, '.', '-' and '_'." };
+    return viewer[`r${i}`] ? { name, valid: true, available: false, reason: `github.com/${owner}/${name} already exists.` } : { name, valid: true, available: true };
+  });
+  return { owner, checks };
 }
