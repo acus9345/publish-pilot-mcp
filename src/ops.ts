@@ -14,12 +14,14 @@ import { RELEASE_WORKFLOW_FILE } from "./workflows.js";
 /** Thrown for problems the user (or model) can fix; the message says how. */
 export class UserError extends Error {}
 
+/** One step of a tool's work. Successful steps carry only a short summary, to keep results small. */
 export interface StepResult {
   step: string;
-  command: string;
   ok: boolean;
   skipped?: boolean;
-  output: string;
+  /** Only for failed steps and the user's own commands. */
+  command?: string;
+  output?: string;
 }
 
 interface PackResult {
@@ -71,9 +73,31 @@ function tail(text: string, chars = 3000): string {
   return text.length > chars ? `…${text.slice(-chars)}` : text;
 }
 
-function step(name: string, result: RunResult): StepResult {
-  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
-  return { step: name, command: result.command, ok: result.ok, output: tail(result.timedOut ? `${output}\n(timed out)` : output) };
+/** npm 12 announces every script it runs and lists the tarball on stderr; none of it helps the model. */
+const NOISE = /^npm (notice|warn run)\b.*$|^npm error A complete log of this run can be found in.*$/gm;
+
+/** Tool output without npm chatter and blank lines. */
+export function denoise(text: string): string {
+  return text.replace(NOISE, "").replace(/\n{2,}/g, "\n").trim();
+}
+
+/** The last couple of lines, which usually hold the summary ("added 3 packages", "pass 9"). */
+function brief(text: string): string | undefined {
+  const last = text.split("\n").filter((l) => l.trim()).slice(-2).join("\n");
+  return last ? (last.length > 200 ? `…${last.slice(-200)}` : last) : undefined;
+}
+
+/**
+ * Report a finished command. A success keeps only a brief summary; a failure (or `full`, for the
+ * user's own commands) keeps the command and the output tail.
+ */
+function step(name: string, result: RunResult, opts: { full?: boolean; command?: string } = {}): StepResult {
+  const output = denoise([result.stdout, result.stderr].filter(Boolean).join("\n")) + (result.timedOut ? "\n(timed out)" : "");
+  if (result.ok && !opts.full) {
+    const summary = brief(output);
+    return summary ? { step: name, ok: true, output: summary } : { step: name, ok: true };
+  }
+  return { step: name, ok: result.ok, command: opts.command ?? result.command, output: tail(output) };
 }
 
 async function requireManifest(dir: string): Promise<{ kind: ManifestKind; name: string; version: string }> {
@@ -92,7 +116,21 @@ async function venvPython(dir: string): Promise<{ python: string; created?: Step
   return { python, created: step("create virtualenv", created) };
 }
 
-/** Install, lint, build and test. Stops at the first failing step. */
+/**
+ * Is node_modules already installed from the current package.json and lockfile? npm writes
+ * node_modules/.package-lock.json after every install, so it is newer than both when nothing changed.
+ */
+export async function npmInstallCurrent(dir: string): Promise<boolean> {
+  try {
+    const installed = (await stat(join(dir, "node_modules", ".package-lock.json"))).mtimeMs;
+    const inputs = await Promise.all(["package.json", "package-lock.json"].map((f) => stat(join(dir, f)).then((s) => s.mtimeMs, () => 0)));
+    return inputs.every((m) => m <= installed);
+  } catch {
+    return false;
+  }
+}
+
+/** Scan for secrets, install, lint, build and test. Stops at the first failing step. */
 export async function runChecks(dir: string): Promise<{ ok: boolean; steps: StepResult[] }> {
   const manifest = await requireManifest(dir);
   const steps: StepResult[] = [];
@@ -101,17 +139,27 @@ export async function runChecks(dir: string): Promise<{ ok: boolean; steps: Step
     steps.push(result);
     return result.ok;
   };
+  const findings = await scanProject(dir);
+  if (findings.length > 0) {
+    steps.push({ step: "secrets", ok: false, output: findings.map((f) => `${f.kind}: ${f.file}${f.line ? `:${f.line}` : ""}`).join("\n") });
+    return { ok: false, steps };
+  }
   if (manifest.kind === "npm") {
     const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8")) as { scripts?: Record<string, string> };
     const scripts = pkg.scripts ?? {};
-    const installArgs = existsSync(join(dir, "package-lock.json")) ? ["ci"] : ["install"];
-    if (!(await go("install", "npm", installArgs))) return { ok: false, steps };
-    for (const script of ["lint", "typecheck", "build", "test"]) {
-      if (!scripts[script]) {
-        steps.push({ step: script, command: `npm run ${script}`, ok: true, skipped: true, output: `No "${script}" script in package.json.` });
-        continue;
-      }
-      if (!(await go(script, "npm", ["run", script]))) return { ok: false, steps };
+    if (await npmInstallCurrent(dir)) steps.push({ step: "install", ok: true, skipped: true, output: "node_modules is up to date" });
+    else if (!(await go("install", "npm", existsSync(join(dir, "package-lock.json")) ? ["ci"] : ["install"]))) return { ok: false, steps };
+    const script = async (name: string): Promise<StepResult> =>
+      scripts[name] ? step(name, await run("npm", ["run", name], { cwd: dir, timeoutMs: 600_000 })) : { step: name, ok: true, skipped: true, output: "no script" };
+    // Lint and typecheck don't depend on each other, so they run at the same time.
+    steps.push(...(await Promise.all([script("lint"), script("typecheck")])));
+    if (steps.some((s) => !s.ok)) return { ok: false, steps };
+    // Many test scripts build first (`npm run build && …` or a pretest hook); don't build twice.
+    const testBuilds = /\bnpm run build\b/.test(scripts.test ?? "") || /\bbuild\b/.test(scripts.pretest ?? "");
+    for (const name of ["build", "test"]) {
+      const result = name === "build" && testBuilds && scripts.test ? { step: "build", ok: true, skipped: true, output: "runs as part of test" } : await script(name);
+      steps.push(result);
+      if (!result.ok) return { ok: false, steps };
     }
     return { ok: true, steps };
   }
@@ -142,15 +190,27 @@ export async function inspectPackage(dir: string): Promise<Record<string, unknow
   let files: string[] = [];
   const steps: StepResult[] = [];
   if (manifest.kind === "npm") {
-    const pack = await run("npm", ["pack", "--dry-run", "--json"], { cwd: dir, timeoutMs: 300_000 });
-    steps.push({ ...step("npm pack --dry-run", pack), output: pack.ok ? "(file list parsed below)" : tail(pack.stderr) });
-    const parsed = pack.ok ? parsePackJson(pack.stdout) : null;
-    if (pack.ok && !parsed) steps.push({ step: "parse file list", command: "", ok: false, output: tail(pack.stdout) });
+    // `npm publish --dry-run --json` prints the same file list as `npm pack`, so one command
+    // (and one prepack build) does both. It refuses an already published version; then pack lists the files.
+    const publish = await run("npm", ["publish", "--dry-run", "--json", ...(manifest.name.startsWith("@") ? ["--access", "public"] : [])], { cwd: dir, timeoutMs: 300_000 });
+    let parsed = publish.ok ? parsePackJson(publish.stdout) : null;
+    const published = !publish.ok && /previously published|cannot publish over/i.test(publish.stdout + publish.stderr);
+    steps.push(
+      publish.ok
+        ? { step: "npm publish --dry-run", ok: true }
+        : published
+          ? { step: "npm publish --dry-run", ok: false, output: `${manifest.version} is already on npm. Run bump_version before publishing.` }
+          : step("npm publish --dry-run", publish),
+    );
+    if (!parsed) {
+      const pack = await run("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: dir, timeoutMs: 300_000 });
+      parsed = pack.ok ? parsePackJson(pack.stdout) : null;
+      if (!parsed) steps.push({ ...step("npm pack --dry-run", pack), ok: false, output: tail(denoise(pack.stderr || pack.stdout)) });
+    }
     if (parsed) {
       files = parsed.files.map((f) => f.path);
-      steps.push({ step: "size", command: "", ok: true, output: `${parsed.size} bytes packed, ${parsed.unpackedSize} bytes unpacked, ${files.length} files` });
+      steps.push({ step: "size", ok: true, output: `${parsed.size} bytes packed, ${parsed.unpackedSize} bytes unpacked, ${files.length} files` });
     }
-    steps.push(step("npm publish --dry-run", await run("npm", ["publish", "--dry-run", ...(manifest.name.startsWith("@") ? ["--access", "public"] : [])], { cwd: dir, timeoutMs: 300_000 })));
   } else if (manifest.kind === "pypi") {
     const { python, created } = await venvPython(dir);
     if (created) steps.push(created);
@@ -517,14 +577,13 @@ export async function tagAndRelease(dir: string, opts: { version?: string; creat
   if (!createRelease) {
     steps.push({
       step: "gh release create",
-      command: "",
       ok: true,
       skipped: true,
       output: workflowReleases ? "release.yml creates the GitHub release when the tag arrives; watch it with watch_workflow." : "Not requested.",
     });
   } else {
     const view = await run("gh", ["release", "view", tag], { cwd: dir });
-    if (view.ok) steps.push({ step: "gh release create", command: "", ok: true, skipped: true, output: `Release ${tag} already exists.` });
+    if (view.ok) steps.push({ step: "gh release create", ok: true, skipped: true, output: `Release ${tag} already exists.` });
     else {
       const changelog = existsSync(join(dir, "CHANGELOG.md")) ? await readFile(join(dir, "CHANGELOG.md"), "utf8") : "";
       const notes = changelogSection(changelog, version) ?? `Release ${tag}`;
@@ -546,6 +605,31 @@ interface RunInfo {
   headBranch: string;
   headSha: string;
   event: string;
+}
+
+/**
+ * Shorten `gh run view --log-failed` output. Each line is "job<TAB>step<TAB>timestamp text"; keep
+ * the text, name each step once, and drop ANSI group markers.
+ */
+export function compactRunLog(log: string): string {
+  const out: string[] = [];
+  let current = "";
+  for (const line of log.split(/\r?\n/)) {
+    const match = /^([^\t]*)\t([^\t]*)\t(?:\d{4}-\d\d-\d\dT[\d:.]+Z )?(.*)$/.exec(line);
+    if (!match) {
+      if (line.trim()) out.push(line);
+      continue;
+    }
+    const [, job, stepName, text] = match;
+    const label = `${job} / ${stepName}`;
+    if (label !== current) {
+      out.push(`## ${label}`);
+      current = label;
+    }
+    const clean = text!.replace(/^##\[(group|endgroup)\]/, "").trimEnd();
+    if (clean) out.push(clean);
+  }
+  return out.join("\n");
 }
 
 /** How often watch_workflow re-checks a running workflow. */
@@ -577,11 +661,11 @@ export async function watchWorkflow(dir: string, workflow = RELEASE_WORKFLOW_FIL
   if (!latest) {
     return { found: false, commit: sha, hint: `No run of ${workflow} for commit ${sha?.slice(0, 7) ?? "HEAD"}${ref ? ` on ${ref}` : ""} yet. Runs can take a few seconds to appear after a push; call again. If it never appears, check the workflow's 'on:' triggers.` };
   }
-  const result: Record<string, unknown> = { found: true, ...latest };
+  const result: Record<string, unknown> = { found: true, status: latest.status, conclusion: latest.conclusion || undefined, ref: latest.headBranch, url: latest.url };
   if (latest.status !== "completed") result.hint = "Still running. Call watch_workflow again.";
   else if (latest.conclusion !== "success") {
     const logs = await run("gh", ["run", "view", String(latest.databaseId), "--log-failed"], { cwd: dir, timeoutMs: 60_000 });
-    result.failedLog = tail(logs.stdout || logs.stderr, 6000);
+    result.failedLog = tail(compactRunLog(logs.stdout || logs.stderr), 6000);
     result.hint = "Fix the cause, then bump_version (patch), commit, and tag_and_release the new version. Never delete or move the old tag.";
   }
   return result;
@@ -619,7 +703,7 @@ export async function runCommandList(commands: string | readonly string[], opts:
   const list = typeof commands === "string" ? [commands] : [...commands];
   const steps: StepResult[] = [];
   for (const [index, command] of list.entries()) {
-    const result = step(list.length === 1 ? "command" : `command ${index + 1}/${list.length}`, await runShell(command, { cwd: opts.cwd, timeoutMs: 600_000, env: opts.env }));
+    const result = step(list.length === 1 ? "command" : `command ${index + 1}/${list.length}`, await runShell(command, { cwd: opts.cwd, timeoutMs: 600_000, env: opts.env }), { full: true, command });
     steps.push(result);
     if (!result.ok) {
       const skipped = list.slice(index + 1);
@@ -654,8 +738,8 @@ export async function verifyInstall(opts: {
     if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(opts.repoUrl.replace(/\.git$/, ""))) throw new UserError("repoUrl must look like https://github.com/owner/repo.");
     if (!(await add("git clone", run("git", ["clone", opts.repoUrl, "project"], { cwd: dir, timeoutMs: 300_000 })))) {
       const failed = steps[steps.length - 1]!;
-      if (/Authentication|could not read Username|not found|403/i.test(failed.output)) {
-        failed.output += "\nFor a private repo, git needs your GitHub login: run `gh auth setup-git` once, then try again.";
+      if (/Authentication|could not read Username|not found|403/i.test(failed.output ?? "")) {
+        failed.output = (failed.output ?? "") + "\nFor a private repo, git needs your GitHub login: run `gh auth setup-git` once, then try again.";
       }
       return { ok: false, dir, steps };
     }
@@ -665,7 +749,8 @@ export async function verifyInstall(opts: {
   if (!opts.registry || !opts.name) throw new UserError("Pass either repoUrl, or registry and name.");
   const spec = opts.version ? `${opts.name}@${opts.version}` : opts.name;
   if (opts.registry === "npm") {
-    if (!(await add("npm init", run("npm", ["init", "-y"], { cwd: dir })))) return { ok: false, dir, steps };
+    // A minimal package.json is all `npm init -y` would add, without starting npm.
+    await writeFile(join(dir, "package.json"), JSON.stringify({ name: "publish-pilot-verify", version: "1.0.0", private: true }));
     if (!(await add("npm install", run("npm", ["install", spec, "--registry", "https://registry.npmjs.org/"], { cwd: dir, timeoutMs: 300_000 })))) return { ok: false, dir, steps };
   } else if (opts.registry === "pypi") {
     const { python, created } = await venvPython(dir);

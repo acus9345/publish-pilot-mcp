@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Fewer tokens per tool call, and faster checks.
+
+### Changed
+
+- The tool list the model reads on every turn is about half the size (about 2,400 tokens instead of 4,700): shorter descriptions, no titles, and no JSON Schema dialect URL or default task setting on each tool.
+- Results are about 60% smaller on a typical publish. Successful steps report a one-line summary instead of their whole output, npm's `npm notice` chatter is dropped, `preflight` returns versions and account names (with next steps only when something is missing), `check_names` lists taken names instead of one record per name, `watch_workflow` returns only status, conclusion, ref and URL, and failed workflow logs lose their job, step and timestamp columns.
+- `run_checks` skips the install when `node_modules` is newer than `package.json` and the lockfile, runs lint and typecheck at the same time, and skips the separate build when the test script already builds (about 3 s to 1.4 s on a small project). It also scans for secrets first.
+- `inspect_package` gets the file list from `npm publish --dry-run --json`, so the project builds once instead of twice, and says plainly when the version is already on npm.
+- `verify_install` writes the temp `package.json` itself instead of starting `npm init`.
+- README: an optional global install that starts in about 0.2 s instead of about 0.9 s with `npx`.
+
+### Removed
+
+- `scan_secrets`: `run_checks`, `git_commit` and `inspect_package` already scan.
+- `open_url`: use `notify` with `url`.
+
 ## [0.3.0] - 2026-10-19
 
 ### Changed

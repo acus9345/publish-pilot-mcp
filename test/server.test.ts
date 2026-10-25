@@ -37,13 +37,11 @@ describe("MCP server", () => {
         "job_status",
         "login",
         "notify",
-        "open_url",
         "preflight",
         "publish_package",
         "run_checks",
         "run_command",
         "scaffold_project",
-        "scan_secrets",
         "setup_trusted_publishing",
         "tag_and_release",
         "verify_install",
@@ -67,16 +65,22 @@ describe("MCP server", () => {
     expect(text(result)).toMatch(/^Error: Refused.*new version/);
   });
 
-  it("refuses to open non-registry URLs", async () => {
-    const result = await client.callTool({ name: "open_url", arguments: { url: "https://example.com" } });
-    expect(JSON.parse(text(result))).toMatchObject({ opened: false });
+  it("keeps the tool list small", async () => {
+    const { tools } = await client.listTools();
+    for (const tool of tools) {
+      expect(tool.inputSchema).not.toHaveProperty("$schema");
+      expect(tool).not.toHaveProperty("execution");
+    }
+    // About 3.6 characters per token: stay under about 2,400 tokens for all tools (0.3.0 used about 4,700).
+    expect(JSON.stringify(tools).length).toBeLessThan(8_800);
   });
 
-  it("scans for secrets", async () => {
+  it("run_checks stops at secrets before running anything", async () => {
     const dir = await tempDir();
+    await writeFile(join(dir, "package.json"), JSON.stringify({ name: "x", version: "1.0.0" }));
     await writeFile(join(dir, ".env"), "X=1");
-    const result = await client.callTool({ name: "scan_secrets", arguments: { dir } });
-    expect(JSON.parse(text(result))).toMatchObject({ clean: false, findings: [{ file: ".env" }] });
+    const result = await client.callTool({ name: "run_checks", arguments: { dir } });
+    expect(JSON.parse(text(result))).toMatchObject({ ok: false, steps: [{ step: "secrets", ok: false }] });
   });
 
   it("gives a friendly error for a folder without a manifest", async () => {
@@ -120,7 +124,7 @@ describe("MCP server", () => {
     const { tools } = await client.listTools();
     for (const name of ["job_status", "watch_workflow"]) {
       const schema = tools.find((t) => t.name === name)!.inputSchema as unknown as { properties: { waitSeconds: { description: string } } };
-      expect(schema.properties.waitSeconds.description).toMatch(/Capped at 45 s/);
+      expect(schema.properties.waitSeconds.description).toMatch(/Max 45 s/);
     }
   });
 

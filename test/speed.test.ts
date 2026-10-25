@@ -1,11 +1,64 @@
 import { execFileSync } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { mkdir, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { cached, clearCache } from "../src/cache.js";
 import { firstFree, type NameCheck } from "../src/names.js";
-import { tagAndRelease } from "../src/ops.js";
+import { compactRunLog, denoise, npmInstallCurrent, runCommandList, tagAndRelease } from "../src/ops.js";
+import { compactPreflight } from "../src/preflight.js";
 import { tempDir } from "./helpers.js";
+
+describe("small results", () => {
+  it("drops npm chatter", () => {
+    const text = "npm notice run x@1.0.0 build\nnpm notice run tsc\nreal line\n\nnpm notice 1.1kB LICENSE\nnpm error code E403\nnpm error A complete log of this run can be found in: C:\\x.log";
+    expect(denoise(text)).toBe("real line\nnpm error code E403");
+  });
+
+  it("keeps only a summary of successful steps but the full output of the user's commands", async () => {
+    const dir = await tempDir();
+    const result = await runCommandList(['node -e "console.log(1);console.log(2);console.log(3)"'], { cwd: dir });
+    expect(result.steps[0]).toMatchObject({ ok: true, command: 'node -e "console.log(1);console.log(2);console.log(3)"', output: "1\n2\n3" });
+  });
+
+  it("shortens failed workflow logs", () => {
+    const log = "release\tRun npm test\t2026-10-19T05:50:10.1234567Z ##[group]Run npm test\nrelease\tRun npm test\t2026-10-19T05:50:11.0000000Z FAIL a.test.ts\nrelease\tRun npm test\t2026-10-19T05:50:11.1000000Z ##[endgroup]";
+    expect(compactRunLog(log)).toBe("## release / Run npm test\nRun npm test\nFAIL a.test.ts");
+  });
+
+  it("reports preflight as versions and accounts", () => {
+    const report = {
+      target: "both" as const,
+      registry: "npm" as const,
+      tools: [
+        { name: "git", installed: true, version: "git version 2.45.1.windows.1", neededFor: "always" },
+        { name: "gh", installed: false, neededFor: "GitHub repo" },
+      ],
+      missingTools: ["gh"],
+      auth: [{ service: "npm" as const, loggedIn: true, account: "me", detail: "" }],
+      gitIdentity: { name: "Me", email: "me@example.com" },
+      nextSteps: ["Install gh"],
+    };
+    expect(compactPreflight(report)).toEqual({ ready: false, tools: { git: "2.45.1", gh: false }, auth: { npm: "me" }, git: "Me <me@example.com>", next: ["Install gh"] });
+    expect(compactPreflight({ ...report, tools: [report.tools[0]!], missingTools: [] })).not.toHaveProperty("next");
+  });
+});
+
+describe("npmInstallCurrent", () => {
+  it("is true only when node_modules was installed after the last manifest change", async () => {
+    const dir = await tempDir();
+    await writeFile(join(dir, "package.json"), "{}");
+    expect(await npmInstallCurrent(dir)).toBe(false);
+    await mkdir(join(dir, "node_modules"));
+    await writeFile(join(dir, "node_modules", ".package-lock.json"), "{}");
+    const old = new Date(Date.now() - 60_000);
+    const installed = new Date(Date.now() - 30_000);
+    await utimes(join(dir, "package.json"), old, old);
+    await utimes(join(dir, "node_modules", ".package-lock.json"), installed, installed);
+    expect(await npmInstallCurrent(dir)).toBe(true);
+    await writeFile(join(dir, "package-lock.json"), "{}");
+    expect(await npmInstallCurrent(dir)).toBe(false);
+  });
+});
 
 describe("cached", () => {
   it("shares one call between concurrent and later callers", async () => {

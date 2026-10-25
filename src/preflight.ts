@@ -173,6 +173,15 @@ export async function preflight(target: Target, registry?: Registry): Promise<Pr
   return { target, registry, tools, missingTools, auth, gitIdentity, nextSteps };
 }
 
+/** The preflight report in as few tokens as possible: versions and account names, plus next steps only when something is missing. */
+export function compactPreflight(report: PreflightReport): Record<string, unknown> {
+  const tools = Object.fromEntries(report.tools.map((t) => [t.name, t.installed ? (/\d+(?:\.\d+)+/.exec(t.version ?? "")?.[0] ?? true) : false]));
+  const auth = Object.fromEntries(report.auth.map((a) => [a.service, a.loggedIn ? (a.account ?? true) : false]));
+  const { name, email } = report.gitIdentity;
+  const ready = report.missingTools.length === 0 && report.auth.every((a) => a.loggedIn) && Boolean(name && email);
+  return { ready, tools, auth, git: name || email ? `${name ?? "?"} <${email ?? "?"}>` : false, ...(ready ? {} : { next: report.nextSteps }) };
+}
+
 /** The command that installs a tool on this OS. */
 export function installCommand(name: string): { cmd: string; args: string[] } | null {
   const entry = TOOL_CATALOG[name];

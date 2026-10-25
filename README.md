@@ -52,6 +52,28 @@ macOS and Linux:
 
 Any other MCP client: run `npx -y publish-pilot-mcp` as a stdio server (`cmd /c npx -y publish-pilot-mcp` on Windows).
 
+**Faster start (optional).** `npx` checks the registry every time the client starts the server, which adds about 0.7 s. A global install starts in about 0.2 s, but you update it yourself (`npm install -g publish-pilot-mcp@latest`):
+
+```sh
+npm install -g publish-pilot-mcp
+npm root -g
+```
+
+Then point the client at `node` and the installed `dist/cli.js`, using the folder `npm root -g` printed. For example, on Windows:
+
+```json
+{
+  "mcpServers": {
+    "publish-pilot": {
+      "command": "node",
+      "args": ["C:\\Users\\you\\AppData\\Roaming\\npm\\node_modules\\publish-pilot-mcp\\dist\\cli.js"]
+    }
+  }
+}
+```
+
+On macOS and Linux, `"command": "publish-pilot-mcp"` with no args also works.
+
 ## Quick start
 
 1. Check that your machine is ready:
@@ -96,18 +118,17 @@ After that, every release is a pushed `v*` tag. GitHub Actions publishes with OI
 | `job_status` | Polls a running login or publish job: status, output, URLs and codes. |
 | `scaffold_project` | Creates source, tests, README, LICENSE, CHANGELOG, .gitignore, manifest and workflows. Never overwrites files. With `target: "repo"` the README explains clone-and-build and the manifest blocks registry publishing. With `private: true`, CI runs on Ubuntu only. |
 | `add_workflows` | Writes `ci.yml` and a `release.yml` that uses trusted publishing (OIDC), skips versions that already exist and creates a GitHub release from the CHANGELOG. `private: true` keeps CI on Ubuntu, because private repos pay for Actions minutes and Windows/macOS cost 2×/10×. |
-| `run_checks` | Install, lint, typecheck, build and test (npm scripts, a Python `.venv` with pytest, or cargo). |
-| `scan_secrets` | Finds `.env` files, private keys and tokens that would be committed. |
+| `run_checks` | Secret scan, then install, lint, typecheck, build and test (npm scripts, a Python `.venv` with pytest, or cargo). Skips the install when `node_modules` is up to date, runs lint and typecheck at the same time, and doesn't build twice when the test script builds. |
 | `inspect_package` | Runs the publish dry run and lists the files that would ship, flagging junk and secrets. |
 | `git_commit` | Runs `git init -b main` if needed and commits. Refuses if secrets would be committed. |
 | `create_github_repo` | Runs `gh repo create <name> --public/--private --source . --push`, and warns when a private repo's CI would run on paid Windows/macOS minutes. |
 | `publish_package` | Runs `npm publish` (in a terminal window, for npm's 2FA approval), `twine upload` or `cargo publish`. Skips versions that already exist, and waits 24 hours after a rate-limit error. |
 | `setup_trusted_publishing` | Connects the package to `release.yml` (`npm trust github`, or the PyPI/crates.io settings page with the exact values). |
-| `tag_and_release` | Tags `v<version>`, pushes it, and creates the GitHub release from the CHANGELOG, unless `release.yml` already does that. |
+| `tag_and_release` | Tags `v<version>`, pushes the branch and tag in one atomic push, and creates the GitHub release from the CHANGELOG, unless `release.yml` already does that. |
 | `watch_workflow` | Waits for the workflow run of the current commit (release by default) and returns the failing log if it fails. |
 | `bump_version` | Bumps the patch, minor or major version and adds a CHANGELOG entry, or turns the "Unreleased" section into the new version. |
 | `verify_install` | Installs from the real registry (or clones the repo, private ones included) into a new temp folder and runs your README steps one by one, stopping at the first that fails. |
-| `notify` / `open_url` | Desktop notification, and opening a page on github.com, npmjs.com, pypi.org or crates.io. |
+| `notify` | Desktop notification. With `url`, also opens a page on github.com, npmjs.com, pypi.org or crates.io (other hosts are refused). |
 | `run_command` | Runs a command in PowerShell (Windows) or sh. Destructive commands are refused. |
 
 The `publish_project` prompt takes optional `target`, `name`, `description`, `registry`, `visibility`, `license`, `what` and `dir` arguments. Anything you leave out, Claude asks for before it starts.

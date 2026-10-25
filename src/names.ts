@@ -95,6 +95,17 @@ export async function checkRepoName(owner: string, name: string): Promise<NameCh
   return { name, valid: true, available: exists === null ? null : !exists };
 }
 
+/** Name checks grouped by outcome, without the per-name boilerplate: taken names, invalid ones with why, and unknown ones. */
+export function summarizeChecks(checks: NameCheck[]): { taken?: string[]; invalid?: Record<string, string>; unknown?: string[] } {
+  const out: { taken?: string[]; invalid?: Record<string, string>; unknown?: string[] } = {};
+  for (const c of checks) {
+    if (!c.valid) (out.invalid ??= {})[c.name] = c.reason ?? "invalid";
+    else if (c.available === false) (out.taken ??= []).push(c.name);
+    else if (c.available === null) (out.unknown ??= []).push(c.name);
+  }
+  return out;
+}
+
 /** Candidate alternatives, best first. */
 export function nameAlternatives(registry: Registry, name: string, user?: string): string[] {
   const base = name.replace(/^@[^/]+\//, "");

@@ -3,12 +3,12 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
+import { ListToolsRequestSchema, type ServerNotification, type ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { notify, openUrl } from "./desktop.js";
 import { describeJob, getJob, listJobs, run, runShell, stopJob, waitForJob, writeToJob } from "./exec.js";
 import { checkCommand } from "./guard.js";
-import { checkOwnRepoNames, checkRepoName, findFreeName, firstFree, githubLogin } from "./names.js";
+import { checkOwnRepoNames, checkRepoName, findFreeName, firstFree, githubLogin, summarizeChecks } from "./names.js";
 import {
   UserError,
   bumpVersion,
@@ -24,9 +24,8 @@ import {
   watchWorkflow,
 } from "./ops.js";
 import { playbook } from "./playbook.js";
-import { checkTool, installCommand, npmAuth, preflight, TOOL_CATALOG } from "./preflight.js";
+import { checkTool, compactPreflight, installCommand, npmAuth, preflight, TOOL_CATALOG } from "./preflight.js";
 import { scaffoldProject } from "./scaffold.js";
-import { scanProject } from "./secrets.js";
 import { CI_WORKFLOW_FILE, RELEASE_WORKFLOW_FILE, ciWorkflow, releaseWorkflow, repoOnlyReleaseWorkflow } from "./workflows.js";
 import { VERSION } from "./version.js";
 
@@ -68,11 +67,15 @@ function handler<A>(fn: (args: A) => Promise<unknown>): (args: A, extra?: Extra)
   };
 }
 
-const dirArg = z.string().describe("Project folder (absolute path, or relative to the server's working directory).");
-const registryArg = z.enum(["npm", "pypi", "crates"]).describe("Package registry: npm, pypi (PyPI) or crates (crates.io).");
-const targetArg = z.enum(["repo", "package", "both"]).describe("What to publish: a GitHub repo, a registry package, or both.");
+const dirArg = z.string();
+const registryArg = z.enum(["npm", "pypi", "crates"]);
+const targetArg = z.enum(["repo", "package", "both"]);
+const waitNote = `Max ${MAX_WAIT_SECONDS} s per call; call again while running`;
+const privateNote = "Private repo: Ubuntu-only CI to save Actions minutes";
+const shellNote = "List of commands (PowerShell on Windows, sh elsewhere)";
 
 const abs = (dir: string): string => resolve(dir);
+const GITHUB_REPO_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/;
 
 /** Explain common ways a login or publish job ends badly, and what to do next. */
 export function jobHint(running: boolean, exitCode: number | null, output: string): string | undefined {
@@ -86,35 +89,58 @@ export function jobHint(running: boolean, exitCode: number | null, output: strin
   return undefined;
 }
 
+/**
+ * Every tools/list result is sent to the model on each turn, so drop what carries no meaning for
+ * it: the JSON Schema dialect URL on every input schema and the default "forbidden" task setting.
+ */
+export function slimToolList(server: McpServer): void {
+  const inner = server.server;
+  const setRequestHandler = inner.setRequestHandler.bind(inner) as (schema: unknown, handler: (...args: unknown[]) => unknown) => void;
+  (inner as { setRequestHandler: unknown }).setRequestHandler = (schema: unknown, handle: (...args: unknown[]) => unknown) =>
+    setRequestHandler(
+      schema,
+      schema === ListToolsRequestSchema
+        ? async (...args: unknown[]) => {
+            const result = (await handle(...args)) as { tools: Record<string, unknown>[] };
+            for (const tool of result.tools) {
+              delete (tool.inputSchema as Record<string, unknown> | undefined)?.$schema;
+              if ((tool.execution as { taskSupport?: string } | undefined)?.taskSupport === "forbidden") delete tool.execution;
+            }
+            return result;
+          }
+        : handle,
+    );
+}
+
 /** Build the publish-pilot MCP server with all tools and the publish_project prompt. */
 export function createServer(): McpServer {
   const server = new McpServer(
     { name: "publish-pilot", version: VERSION },
     {
       instructions:
-        "publish-pilot takes a project from an empty folder to a published GitHub repo and/or npm, PyPI or crates.io package. Start with the publish_project prompt or call preflight. Long-running logins and publishes return a job id: poll it with job_status. Never enter passwords or 2FA codes for the user; leave sign-in, 2FA and Authorize/Approve/Save clicks to them.",
+        "Publishes projects to GitHub and npm, PyPI or crates.io. Start with the publish_project prompt or preflight. Logins and publishes return a job id; poll job_status. Never enter passwords or 2FA codes: the user does sign-in and Authorize/Approve/Save clicks.",
     },
   );
+
+  slimToolList(server);
 
   // ---------------------------------------------------------------- preflight
   server.registerTool(
     "preflight",
     {
-      title: "Preflight check",
-      description: "Check that git, gh and the registry CLI are installed, which accounts are logged in, and the git identity. Starts no logins. Run this first.",
+      description: "Check tools (git, gh, registry CLI), logins and git identity. Run first.",
       inputSchema: { target: targetArg, registry: registryArg.optional() },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true },
     },
-    handler(async ({ target, registry }) => preflight(target, registry)),
+    handler(async ({ target, registry }) => compactPreflight(await preflight(target, registry))),
   );
 
   server.registerTool(
     "install_tool",
     {
-      title: "Install a missing tool",
-      description: `Install a CLI tool with winget (Windows), brew (macOS) or apt (Linux). Known tools: ${Object.keys(TOOL_CATALOG).join(", ")}. After installing on Windows you may need to restart the MCP client so PATH updates.`,
-      inputSchema: { name: z.enum(Object.keys(TOOL_CATALOG) as [string, ...string[]]).describe("Tool to install.") },
-      annotations: { destructiveHint: false, openWorldHint: true },
+      description: "Install a tool with winget, brew or apt.",
+      inputSchema: { name: z.enum(Object.keys(TOOL_CATALOG) as [string, ...string[]]) },
+      annotations: { destructiveHint: false },
     },
     handler(async ({ name }) => {
       const before = await checkTool(name);
@@ -123,11 +149,12 @@ export function createServer(): McpServer {
       if (!cmd) throw new UserError(`No install recipe for ${name}.`);
       const result = await run(cmd.cmd, cmd.args, { timeoutMs: 900_000 });
       const after = await checkTool(name);
+      if (after.installed) return { installed: true, version: after.version };
       return {
-        installed: after.installed,
+        installed: false,
         command: result.command,
         output: (result.stdout + "\n" + result.stderr).trim().slice(-3000),
-        hint: after.installed ? undefined : "If the install succeeded but the tool is still not found, restart the MCP client (PATH is read at start-up).",
+        hint: "If the install succeeded but the tool is still not found, restart the MCP client (PATH is read at start-up).",
       };
     }),
   );
@@ -135,14 +162,13 @@ export function createServer(): McpServer {
   server.registerTool(
     "check_names",
     {
-      title: "Check package and repo names",
-      description: "Check that a package name is valid and free on the registry and that the GitHub repo name is free. When taken, returns the best free alternative (for npm, a scoped @user/name first).",
+      description: "Check a package name on its registry and a repo name on your GitHub. If taken, returns the first free alternative (npm: @user/name first).",
       inputSchema: {
         registry: registryArg.optional(),
-        packageName: z.string().optional().describe("Package name to check on the registry."),
-        repoName: z.string().optional().describe("GitHub repo name to check under your account."),
+        packageName: z.string().optional(),
+        repoName: z.string().optional(),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true },
     },
     handler(async ({ registry, packageName, repoName }) => {
       if (packageName && !registry) throw new UserError("Pass 'registry' together with 'packageName'.");
@@ -160,13 +186,13 @@ export function createServer(): McpServer {
         const { chosen, checks } = fast
           ? { chosen: freeAt === -1 ? null : repoCandidates[freeAt]!, checks: freeAt === -1 ? fast.checks : fast.checks.slice(0, freeAt + 1) }
           : await firstFree(repoName, repoCandidates.slice(1), (name) => checkRepoName(owner, name));
-        return { owner, requested: repoName, chosen, url: chosen ? `https://github.com/${owner}/${chosen}` : null, checks };
+        return { requested: repoName, chosen, url: chosen ? `https://github.com/${owner}/${chosen}` : null, ...summarizeChecks(checks) };
       };
       const checkPackage = async (): Promise<unknown> => {
         if (!packageName || !registry) return undefined;
         const user = Promise.all([npmUser, ownerPromise]).then(([u, o]) => u ?? o ?? undefined);
         const { chosen, checks } = await findFreeName(registry, packageName, user);
-        return { requested: packageName, chosen, checks };
+        return { requested: packageName, chosen, ...summarizeChecks(checks) };
       };
       const [githubUser, pkg, repo] = await Promise.all([ownerPromise, checkPackage(), checkRepo()]);
       const out: Record<string, unknown> = { githubUser };
@@ -180,14 +206,13 @@ export function createServer(): McpServer {
   server.registerTool(
     "login",
     {
-      title: "Start a browser login",
       description:
-        "Start the browser-based login for github (gh auth login --web), npm (npm login --auth-type=web), pypi or crates. Returns at once with a job id, the one-time code and the URL; the user signs in, does 2FA and clicks Authorize. Poll job_status every 1–2 minutes until running is false.",
+        "Start a browser login. Returns a job with the URL and code; the user signs in and approves. Poll job_status until running is false.",
       inputSchema: {
-        service: z.enum(["github", "npm", "pypi", "crates"]).describe("Which account to log in to."),
-        openBrowser: z.boolean().default(true).describe("Open the login page in the default browser."),
+        service: z.enum(["github", "npm", "pypi", "crates"]),
+        openBrowser: z.boolean().default(true),
       },
-      annotations: { destructiveHint: false, openWorldHint: true },
+      annotations: { destructiveHint: false },
     },
     handler(async ({ service, openBrowser }) => startLogin(service, openBrowser)),
   );
@@ -195,24 +220,17 @@ export function createServer(): McpServer {
   server.registerTool(
     "job_status",
     {
-      title: "Check a background job",
-      description: "Get the status and recent output of a login or publish job. Optionally wait up to waitSeconds for it to finish, or send Enter to it. Without an id, lists all jobs.",
+      description: "Status and output of a login/publish job; without id, lists jobs.",
       inputSchema: {
-        id: z.string().optional().describe("Job id from login, publish_package or setup_trusted_publishing."),
-        waitSeconds: z
-          .number()
-          .int()
-          .min(0)
-          .max(600)
-          .default(0)
-          .describe(`Wait up to this long for the job to finish. Capped at ${MAX_WAIT_SECONDS} s per call so the call returns before common 60 s client timeouts; call again while running is true.`),
-        sendEnter: z.boolean().default(false).describe("Send Enter to the job (for 'Press ENTER' prompts)."),
-        stop: z.boolean().default(false).describe("Stop the job (e.g. to restart a publish whose link expired)."),
+        id: z.string().optional(),
+        waitSeconds: z.number().int().min(0).max(600).default(0).describe(waitNote),
+        sendEnter: z.boolean().default(false).describe("Answer a 'Press ENTER' prompt"),
+        stop: z.boolean().default(false),
       },
       annotations: { openWorldHint: false },
     },
     handler(async ({ id, waitSeconds, sendEnter, stop }) => {
-      if (!id) return listJobs().map((j) => describeJob(j, 500));
+      if (!id) return listJobs().map((j) => describeJob(j, 300));
       const job = getJob(id);
       if (!job) throw new UserError(`No job with id ${id}. Call job_status without an id to list jobs.`);
       if (stop) stopJob(job);
@@ -229,24 +247,24 @@ export function createServer(): McpServer {
   server.registerTool(
     "scaffold_project",
     {
-      title: "Scaffold a project",
       description:
-        "Create a standard project: source, tests, README, LICENSE, CHANGELOG, .gitignore, .gitattributes and a manifest (version 0.1.0, author from git config, repo URL, publishConfig for scoped npm). Adds CI and release workflows when repoUrl is set. For target 'repo' the README explains clone-and-build and the manifest blocks registry publishing; for private repos CI runs on Ubuntu only. Never overwrites existing files.",
+        "Create a project: source, test, README, LICENSE, CHANGELOG, .gitignore, manifest (0.1.0). With repoUrl, also CI and release workflows. Never overwrites files.",
       inputSchema: {
         dir: dirArg,
-        name: z.string().describe("Package name."),
-        description: z.string().describe("One-line description."),
+        name: z.string(),
+        description: z.string(),
         registry: registryArg,
-        license: z.string().default("MIT").describe("SPDX license id."),
-        repoUrl: z.string().regex(/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/).optional().describe("https://github.com/owner/repo"),
-        cli: z.boolean().default(false).describe("Add a command-line entry point with --help and --version (npm, pypi)."),
-        workflows: z.enum(["none", "ci", "ci+release", "ci+repo-release"]).optional().describe("Default with repoUrl: ci+release for target 'both', ci+repo-release for 'repo', ci for 'package'."),
-        target: targetArg.optional().describe("What will be published. Default 'both' when repoUrl is set, otherwise 'package'."),
-        private: z.boolean().default(false).describe("The GitHub repo will be private: CI runs on Ubuntu only to save paid Actions minutes."),
+        license: z.string().default("MIT"),
+        repoUrl: z.string().optional().describe("https://github.com/owner/repo"),
+        cli: z.boolean().default(false).describe("Add a CLI entry point"),
+        workflows: z.enum(["none", "ci", "ci+release", "ci+repo-release"]).optional().describe("Default follows target"),
+        target: targetArg.optional().describe("Default both with repoUrl, else package. repo: never published to a registry"),
+        private: z.boolean().default(false).describe(privateNote),
       },
       annotations: { destructiveHint: false },
     },
     handler(async (args) => {
+      if (args.repoUrl && !GITHUB_REPO_URL.test(args.repoUrl)) throw new UserError("repoUrl must look like https://github.com/owner/repo.");
       const [name, email] = await Promise.all([run("git", ["config", "user.name"]), run("git", ["config", "user.email"])]);
       const author = name.stdout ? `${name.stdout}${email.stdout ? ` <${email.stdout}>` : ""}` : undefined;
       const result = await scaffoldProject({ ...args, dir: abs(args.dir), author });
@@ -257,14 +275,13 @@ export function createServer(): McpServer {
   server.registerTool(
     "add_workflows",
     {
-      title: "Add GitHub workflows",
       description:
-        "Write .github/workflows/ci.yml (install, lint, build, test on push and PR) and optionally release.yml (on v* tags: test, build, publish with trusted publishing via OIDC — skipped if the version exists — then a GitHub release from the CHANGELOG). Existing files are kept unless overwrite is true.",
+        "Write ci.yml and release.yml (on v* tags: test, publish via OIDC unless the version exists, GitHub release from CHANGELOG). Keeps existing files unless overwrite.",
       inputSchema: {
         dir: dirArg,
-        registry: registryArg.optional().describe("Omit for a repo-only project."),
-        release: z.enum(["none", "registry", "github-only"]).default("registry").describe("registry: publish + GitHub release; github-only: just a GitHub release."),
-        private: z.boolean().default(false).describe("Private repo: CI runs on Ubuntu only (Windows minutes count 2x, macOS 10x)."),
+        registry: registryArg.optional().describe("Omit for repo-only"),
+        release: z.enum(["none", "registry", "github-only"]).default("registry"),
+        private: z.boolean().default(false).describe(privateNote),
         overwrite: z.boolean().default(false),
       },
       annotations: { destructiveHint: false },
@@ -297,8 +314,7 @@ export function createServer(): McpServer {
   server.registerTool(
     "run_checks",
     {
-      title: "Install, lint, build and test",
-      description: "Run the project's install, lint, typecheck, build and test steps (npm scripts, a Python .venv with pytest + build, or cargo clippy/build/test). Stops at the first failure and returns its output.",
+      description: "Secret scan, install, lint, typecheck, build, test (npm scripts, .venv + pytest, or cargo). Stops at the first failure.",
       inputSchema: { dir: dirArg },
       annotations: { destructiveHint: false },
     },
@@ -306,26 +322,11 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
-    "scan_secrets",
-    {
-      title: "Scan for secrets",
-      description: "Look for .env files, private keys and tokens in everything that would be committed. Reports file and line, never the secret itself.",
-      inputSchema: { dir: dirArg },
-      annotations: { readOnlyHint: true },
-    },
-    handler(async ({ dir }) => {
-      const findings = await scanProject(abs(dir));
-      return { clean: findings.length === 0, findings };
-    }),
-  );
-
-  server.registerTool(
     "inspect_package",
     {
-      title: "Publish dry run",
-      description: "Run the registry dry run (npm pack/publish --dry-run, twine check, cargo publish --dry-run), list the files that would be published, and flag junk or secrets.",
+      description: "Publish dry run: files that would ship, junk/secret warnings, registry check.",
       inputSchema: { dir: dirArg },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true },
     },
     handler(async ({ dir }) => inspectPackage(abs(dir))),
   );
@@ -334,8 +335,7 @@ export function createServer(): McpServer {
   server.registerTool(
     "git_commit",
     {
-      title: "Commit",
-      description: "git init (branch main) if needed, refuse when secrets or .env files would be committed, then stage everything and commit.",
+      description: "Stage all and commit (git init -b main if needed). Refuses if secrets would be committed.",
       inputSchema: { dir: dirArg, message: z.string().describe("Commit message.") },
       annotations: { destructiveHint: false },
     },
@@ -345,15 +345,14 @@ export function createServer(): McpServer {
   server.registerTool(
     "create_github_repo",
     {
-      title: "Create the GitHub repo and push",
-      description: "gh repo create <name> --public|--private --source=. --push. Needs a commit and a GitHub login. If the repo already exists and is this folder's origin, just pushes.",
+      description: "Create the GitHub repo from the folder and push. If it is already this folder's origin, just pushes.",
       inputSchema: {
         dir: dirArg,
-        name: z.string().describe("Repo name (without owner)."),
+        name: z.string(),
         visibility: z.enum(["public", "private"]).default("public"),
         description: z.string().optional(),
       },
-      annotations: { destructiveHint: false, openWorldHint: true },
+      annotations: { destructiveHint: false },
     },
     handler(async ({ dir, name, visibility, description }) => createGithubRepo(abs(dir), name, visibility, description)),
   );
@@ -361,16 +360,15 @@ export function createServer(): McpServer {
   server.registerTool(
     "publish_package",
     {
-      title: "Publish the package",
       description:
-        "Publish from the terminal (npm publish [--access public], twine upload, cargo publish). Skips when the version already exists, and for 24 hours after the registry answered E429 (retries can extend a rate-limit block). Returns a job; npm approval runs in a real terminal. If an approval link expires, call again.",
+        "Publish to the registry; returns a job (npm approval opens in a terminal). Skips existing versions, and refuses for 24 h after an E429.",
       inputSchema: {
         dir: dirArg,
         dryRun: z.boolean().default(false),
-        openBrowser: z.boolean().default(true).describe("Open approval pages in the default browser."),
-        force: z.boolean().default(false).describe("Publish even within 24 hours of an E429. Only when the user confirms the block was lifted."),
+        openBrowser: z.boolean().default(true),
+        force: z.boolean().default(false).describe("Ignore the E429 wait; only if the user says the block was lifted"),
       },
-      annotations: { destructiveHint: false, openWorldHint: true },
+      annotations: { destructiveHint: false },
     },
     handler(async ({ dir, dryRun, openBrowser, force }) => publishPackage(abs(dir), { dryRun, openBrowser, force })),
   );
@@ -378,16 +376,15 @@ export function createServer(): McpServer {
   server.registerTool(
     "setup_trusted_publishing",
     {
-      title: "Set up trusted publishing",
       description:
-        "Connect the package to the GitHub release workflow (OIDC, no stored tokens). npm: runs `npm trust github` (the user approves with 2FA) and returns the settings page as fallback. PyPI/crates.io: opens the settings page and returns the exact values to fill in. The user clicks Save.",
+        "Link the package to release.yml for OIDC publishing. npm: npm trust (package must exist; user approves 2FA). PyPI/crates: opens the settings page with the values; user clicks Save.",
       inputSchema: {
         dir: dirArg,
-        repo: z.string().describe("owner/name of the GitHub repo."),
+        repo: z.string().describe("owner/name"),
         workflowFile: z.string().default(RELEASE_WORKFLOW_FILE),
         openBrowser: z.boolean().default(true),
       },
-      annotations: { destructiveHint: false, openWorldHint: true },
+      annotations: { destructiveHint: false },
     },
     handler(async ({ dir, repo, workflowFile, openBrowser }) => setupTrustedPublishing(abs(dir), repo, workflowFile, openBrowser)),
   );
@@ -395,18 +392,14 @@ export function createServer(): McpServer {
   server.registerTool(
     "tag_and_release",
     {
-      title: "Tag, push and release",
       description:
-        "Create tag v<version> from the manifest, push the branch and tag, and create the GitHub release with notes from CHANGELOG.md unless the repo's release.yml already does that on tags. Never moves or deletes tags.",
+        "Tag v<manifest version>, push branch and tag together, and create the GitHub release from CHANGELOG unless release.yml does. Never moves tags.",
       inputSchema: {
         dir: dirArg,
-        version: z.string().optional().describe("Must match the manifest; defaults to it."),
-        createRelease: z
-          .boolean()
-          .optional()
-          .describe("Default: create the release here only when .github/workflows/release.yml doesn't create one. Pass true or false to force."),
+        version: z.string().optional(),
+        createRelease: z.boolean().optional(),
       },
-      annotations: { destructiveHint: false, openWorldHint: true },
+      annotations: { destructiveHint: false },
     },
     handler(async ({ dir, version, createRelease }) => tagAndRelease(abs(dir), { version, createRelease })),
   );
@@ -414,22 +407,15 @@ export function createServer(): McpServer {
   server.registerTool(
     "watch_workflow",
     {
-      title: "Watch a workflow run",
       description:
-        "Wait for the workflow run (default release.yml) for the folder's current commit, optionally on a branch or tag, and report its result with the failing log on failure. Matching the commit avoids reporting an older run right after a push.",
+        "Result of the workflow run for HEAD (default release.yml), with failed logs.",
       inputSchema: {
         dir: dirArg,
         workflow: z.string().default(RELEASE_WORKFLOW_FILE),
-        ref: z.string().optional().describe("Only runs for this tag/branch, e.g. v0.1.1."),
-        waitSeconds: z
-          .number()
-          .int()
-          .min(0)
-          .max(600)
-          .default(50)
-          .describe(`Capped at ${MAX_WAIT_SECONDS} s per call so the call returns before common 60 s client timeouts; while the run is in progress, call again.`),
+        ref: z.string().optional().describe("Tag or branch"),
+        waitSeconds: z.number().int().min(0).max(600).default(MAX_WAIT_SECONDS).describe(waitNote),
       },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true },
     },
     handler(async ({ dir, workflow, ref, waitSeconds }) => watchWorkflow(abs(dir), workflow, Math.min(waitSeconds, MAX_WAIT_SECONDS), ref)),
   );
@@ -437,13 +423,12 @@ export function createServer(): McpServer {
   server.registerTool(
     "bump_version",
     {
-      title: "Bump the version",
       description:
-        "Bump the manifest version (patch/minor/major) and record it in CHANGELOG.md: given notes become a new entry; without notes, a non-empty 'Unreleased' section becomes the new version. Does not commit.",
+        "Bump the version and add notes to CHANGELOG (no notes: Unreleased becomes the version). Does not commit.",
       inputSchema: {
         dir: dirArg,
         level: z.enum(["patch", "minor", "major"]).default("patch"),
-        notes: z.string().default("").describe("Markdown for the CHANGELOG entry, e.g. '### Fixed\\n\\n- Release workflow.'"),
+        notes: z.string().default("").describe("Markdown"),
       },
       annotations: { destructiveHint: false },
     },
@@ -453,19 +438,16 @@ export function createServer(): McpServer {
   server.registerTool(
     "verify_install",
     {
-      title: "Verify like a new user",
       description:
-        "In a brand-new temp folder, install the published package from the real registry (or git clone the repo, private ones included) and run the README's commands one by one, stopping at the first that fails. Installed executables are on PATH.",
+        "In a fresh temp folder, install the published package (or clone repoUrl) and run commands in order, stopping at the first failure. Its executables are on PATH.",
       inputSchema: {
         registry: registryArg.optional(),
         name: z.string().optional(),
         version: z.string().optional(),
-        repoUrl: z.string().optional().describe("https://github.com/owner/repo — clone instead of installing."),
-        command: z
-          .union([z.string(), z.array(z.string()).min(1)])
-          .describe("Commands to run in the folder (PowerShell on Windows, sh elsewhere). Prefer a list: each one must succeed before the next runs."),
+        repoUrl: z.string().optional(),
+        command: z.union([z.string(), z.array(z.string()).min(1)]).describe(shellNote),
       },
-      annotations: { destructiveHint: false, openWorldHint: true },
+      annotations: { destructiveHint: false },
     },
     handler(async (args) => verifyInstall(args)),
   );
@@ -474,48 +456,35 @@ export function createServer(): McpServer {
   server.registerTool(
     "notify",
     {
-      title: "Desktop notification",
-      description: "Show a desktop notification, e.g. 'Ready for your approval'.",
-      inputSchema: { title: z.string().default("publish-pilot"), message: z.string() },
+      description: "Desktop notification, e.g. 'Ready for your approval'. url opens a github.com, npmjs.com, pypi.org or crates.io page.",
+      inputSchema: { message: z.string(), title: z.string().default("publish-pilot"), url: z.string().optional() },
       annotations: { destructiveHint: false },
     },
-    handler(async ({ title, message }) => ({ shown: await notify(title, message) })),
-  );
-
-  server.registerTool(
-    "open_url",
-    {
-      title: "Open a page in the browser",
-      description: "Open an https page on github.com, npmjs.com, pypi.org or crates.io in the default browser. Other hosts are refused.",
-      inputSchema: { url: z.string() },
-      annotations: { destructiveHint: false, openWorldHint: true },
-    },
-    handler(async ({ url }) => openUrl(url)),
+    handler(async ({ title, message, url }) => {
+      const [shown, page] = await Promise.all([notify(title, message), url ? openUrl(url) : undefined]);
+      return page ? { shown, ...page } : { shown };
+    }),
   );
 
   server.registerTool(
     "run_command",
     {
-      title: "Run a shell command",
-      description: "Run a command line (PowerShell on Windows, sh elsewhere) and return its output, redacted of tokens. Destructive commands (force-push, deleting tags/repos/releases, unpublish, recursive delete) are refused.",
+      description: "Run a shell command (PowerShell on Windows, sh elsewhere). Destructive ones (force-push, deleting tags/repos/releases, unpublish, rm -r) are refused.",
       inputSchema: {
         command: z.string(),
         cwd: z.string().optional(),
         timeoutSeconds: z.number().int().min(1).max(1800).default(300),
       },
-      annotations: { destructiveHint: true, openWorldHint: true },
+      annotations: { destructiveHint: true },
     },
     handler(async ({ command, cwd, timeoutSeconds }) => {
       const refused = checkCommand(command);
       if (refused) throw new UserError(refused);
       const result = await runShell(command, { cwd: cwd ? abs(cwd) : undefined, timeoutMs: timeoutSeconds * 1000 });
-      return {
-        exitCode: result.exitCode,
-        ok: result.ok,
-        timedOut: result.timedOut,
-        stdout: result.stdout.slice(-20_000),
-        stderr: result.stderr.slice(-10_000),
-      };
+      const out: Record<string, unknown> = { exitCode: result.exitCode, stdout: result.stdout.slice(-20_000) };
+      if (result.stderr) out.stderr = result.stderr.slice(-10_000);
+      if (result.timedOut) out.timedOut = true;
+      return out;
     }),
   );
 
@@ -523,7 +492,6 @@ export function createServer(): McpServer {
   server.registerPrompt(
     "publish_project",
     {
-      title: "Publish a project end to end",
       description: "Step-by-step plan to take a project from nothing to a published GitHub repo and/or package using these tools.",
       argsSchema: {
         target: z.string().optional().describe("repo, package or both"),

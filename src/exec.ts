@@ -326,16 +326,20 @@ export function waitForJob(job: Job, timeoutMs: number, predicate?: (job: Job) =
 }
 
 /** Plain-object view of a job that is safe to return to the model. */
-export function describeJob(job: Job, tailChars = 4000): Record<string, unknown> {
-  return {
+export function describeJob(job: Job, tailChars = 3000): Record<string, unknown> {
+  const info: Record<string, unknown> = {
     id: job.id,
     label: job.label,
-    command: job.command,
     running: job.running,
     exitCode: job.exitCode,
-    secondsRunning: Math.round((Date.now() - job.startedAt) / 1000),
-    urls: job.urls,
-    codes: job.codes,
-    outputTail: cleanOutput(job.output).slice(-tailChars).trim(),
+    seconds: Math.round((Date.now() - job.startedAt) / 1000),
   };
+  if (job.urls.length) info.urls = job.urls;
+  if (job.codes.length) info.codes = job.codes;
+  const output = cleanOutput(job.output)
+    .replace(/^npm (notice|warn run)\b.*$/gm, "")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+  if (output) info.outputTail = output.slice(-tailChars);
+  return info;
 }
