@@ -1,6 +1,6 @@
 # publish-pilot-mcp
 
-An MCP server that lets Claude take a project from an empty folder to a published GitHub repo and npm, PyPI or crates.io package. It checks your tools, handles logins, scaffolds the project, runs checks, publishes and releases. You only do the sign-in, 2FA and approval clicks.ANDDDDD whats the difference between this mcp and other mcps(like windows mcp) those control ur pcs?
+An MCP server that lets Claude(or any other agent) take a project from an empty folder to a published GitHub repo and npm, PyPI or crates.io package. It checks your tools, handles logins, scaffolds the project, runs checks, publishes and releases. You only do the sign-in, 2FA and approval clicks.ANDDDDD whats the difference between this mcp and other mcps(like windows mcp) those control ur pcs?
 well this mcp would less likely to control ur whole pc to get the job done which means u can either publish multiple repos at the same time or use ur pc while Claude is doing the job*
 
 [![npm](https://img.shields.io/npm/v/publish-pilot-mcp)](https://www.npmjs.com/package/publish-pilot-mcp)
